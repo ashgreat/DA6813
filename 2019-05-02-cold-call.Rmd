@@ -1,0 +1,615 @@
+---
+title: "Cold Call"
+author: "Ashwin Malshe"
+date: "5/1/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+```
+
+
+In this exercise, we will build a prescriptive model using car insurance sales data. The data set is available on Kaggle from this link: https://www.kaggle.com/kondla/carinsurance
+
+The original objective for this data set as described on Kaggle was this:
+
+*We are looking at cold call results. Turns out, same salespeople called existing insurance customers up and tried to sell car insurance. What you have are details about the called customers. Their age, job, marital status, whether the have home insurance, a car loan, etc. As I said, super simple.*
+
+*What I would love to see is some of you applying some crazy XGBoost classifiers, which we can square off against some logistic regressions. It would be curious to see what comes out on top. Thank you for your time, I hope you enjoy using the data set.*
+
+I have changed this *predictive* objective and converted this into a marketing *prescriptive* problem.
+
+## New objectives
+
+1. Build a model that will help marketers segment their customer list
+
+2. Identify a target group for immediate contact and another target group for more expert intervention
+
+
+Along the way, we will learn many things in modeling such as data preprocessing, hyper parameter tuning, model selection, etc.
+
+## Data
+
+Load the necessary packages. Install the packages that you don't have.
+
+```{r message=FALSE, warning=FALSE}
+
+# install.packages("RANN", "lime", "ROSE")
+
+library(dplyr)
+library(psych)
+library(caret)
+library(lubridate)
+library(RANN) # Used for KNN
+library(lime) # Used for variable importance
+library(ggplot2)
+library(ROSE) # Used for synthetic samples
+library(mice) # Used to impute missing categorical values
+```
+
+You can download the csv files from [Kaggle](https://www.kaggle.com/kondla/carinsurance) or you can directly read the files from my Github repository, which I do next.
+
+We are first going to use only the file names `carInsurance_train.csv`. 
+
+```{r}
+dt <- read.csv("https://raw.githubusercontent.com/ashgreat/datasets/master/carInsurance_train.csv",
+               stringsAsFactors = FALSE)
+```
+
+### Data exploration
+
+Check out the names of the columns. Compare to the names in the documentation on Kaggle to make sure we are dealing with the same data set. Furthermore, please understand the meaning of each variable.
+
+```{r}
+names(dt)
+```
+
+Learn the variable classes.
+
+```{r}
+sapply(dt, class)
+```
+
+`CallStart` and `CallEnd` are both characters in the data set but in reality they have `hour:minute:second` format. Let's convert them to the right format using `lubridate` package. Separate out hour, minutes, and second from these two variables. Also create a variable`CallDuration`  that captures the duration of the call in seconds. Finally, convert all the character variables to factors.
+
+```{r}
+dt <- dt %>% 
+  mutate(CallStart = lubridate::hms(CallStart),
+         CallEnd  = lubridate::hms(CallEnd),
+         CallStartHour = hour(CallStart),
+         CallStartMin = minute(CallStart),
+         CallStartSec = second(CallStart),
+         CallEndHour = hour(CallEnd),
+         CallEndMin = minute(CallEnd),
+         CallEndSec = second(CallEnd),
+         CallDuration = lubridate::period_to_seconds(CallEnd) - lubridate::period_to_seconds(CallStart)) %>% 
+  select(-CallStart, -CallEnd, -Id) %>% 
+  mutate_if(is.character, as.factor)
+```
+
+
+Get the descriptive
+
+```{r, warning=FALSE}
+psych::describe(dt) %>% 
+  select(-vars, -trimmed, -mad, -range, -se) %>% 
+  knitr::kable() # kable prints nice-looking tables.
+```
+
+### Imputing missing values
+
+Most of the variables have no missing values. However, `Job` and `Education` have a few missing values, which we can easily impute by using a predictive model. `Communication` has 902 missing values and `Outcome` has 3042 missing values. That's too much to just impute. Here we can create a separate category for the missing values.
+
+In case of `Communication`, the missing value is not available. We will create a category for "Not Available". Similarly, for `Outcome` the missing values mean that the person was not contacted before and therefore there is no outcome. Therefore, we will create a category for "None".
+
+Also note that `DaysPassed` takes a value of -1 when the person was not in any previous campaign. Keeping it at -1 is a mistake. Ideally, we should put $\infty$ in that place. Instead, we will use a very large value. As the maximum days passed is 855, let's use 1,000 as the upper limit.
+
+With that, let's make the changes to our data set.
+
+```{r}
+# Duplicate the original dataset
+
+dt2 <- dt
+
+```
+
+First make the adjustments to `Communication`, `Outcome`, and `DaysPassed`.
+
+```{r}
+
+dt2 <- dt2 %>% 
+  mutate(Communication = ifelse(is.na(Communication), 
+                                "Not Available", 
+                                Communication),
+         Outcome = ifelse(is.na(Outcome), 
+                          "None", 
+                          Outcome),
+         DaysPassed = ifelse(DaysPassed == -1, 
+                             1000, 
+                             DaysPassed))
+
+```
+
+
+Next impute missing values `Job` and `Education` and use them for missing values. Set a seed for replication in future.
+
+```{r eval = FALSE}
+set.seed(8934)
+
+miceMod <- mice::mice(subset(dt2, 
+                             select = -CarInsurance), 
+                method = "rf")  # perform mice imputation based on random forest.
+
+```
+
+
+Generate the completed data.
+
+```{r}
+dt3 <- mice::complete(miceMod)
+
+```
+
+Check whether we have all the values imputed now.
+
+```{r}
+anyNA(dt3)
+```
+
+Now let's look at the summary.
+
+```{r, warning=FALSE}
+
+dt3$CarInsurance <- dt2$CarInsurance
+
+psych::describe(dt3) %>% 
+  select(-vars, -trimmed, -mad, -range, -se) %>% 
+  knitr::kable()
+```
+
+
+Finally, we will create dummy variables for all the factors. For this, we will use `dummyVars` function from `caret` package. It will drop the dependent variable, `CarInsurance` from the data, so we will first save it into a vector and then add it back.
+
+Also, `predict` function will create a `matrix`, which we need to convert into a `data frame`.
+
+```{r}
+
+dt4 <- predict(dummyVars(CarInsurance ~ .,
+                         data = dt3,
+                         fullRank = TRUE # Drops the reference category
+                         ),
+               newdata = dt3) %>% 
+  data.frame()
+
+dt4$CarInsurance <- dt2$CarInsurance
+
+# Convert CarInsurance to a factor
+dt4 <- dt4 %>% 
+  mutate(CarInsurance = as.factor(ifelse(CarInsurance == 0, "No", "Yes")))
+
+```
+
+
+### Training and test set
+
+Before we build our predictive model, we will split the sample into a training set and a test set. Usually I use 80 - 20 split. As our sample size is pretty large, this split is reasonable. We will build our model using training data and then evaluate its out-of-sample performance on the test data.
+
+For this we will use `caret`'s `createDataPartition()` function. This function takes a factor as input along with the percentage of split. In our case, we want to split the data in training and testing sets but we want to make sure that the proportion of Yes and No for `CarInsurance` remains the same in the two splits. The output of this function is a numeric vector with values corresponding to the row numbers that we want to keep in the training set. Obviously, the test set has all the rows which are discarded by `createDataPartition()`.
+
+```{r}
+
+# Create a vector with row numbers corresponding to the training data
+
+index <- caret::createDataPartition(dt4$CarInsurance, 
+                             p = 0.8, 
+                             list = FALSE) # caret returns a list by default.
+
+dt4_train <- dt4[index, ]
+dt4_test <- dt4[-index, ]
+
+```
+
+
+## Building the predictive model {#ins-model}
+
+
+We will use random forest for building the predictive model. First define the training controls. The only meaningful hyper parameter that makes substantial difference in accuracy is `mtry` which is the number of variables to use for building each tree in the random forest. You can tune this hyper parameter by using grid search. 
+
+
+```{r eval=FALSE}
+
+trControl <- trainControl(method = "cv", #crossvalidation
+                          number = 10,   # 10 folds
+                          search = "grid",
+                          classProbs = TRUE  #computes class probabilities
+                          ) 
+
+tuneGrid_large <- expand.grid(mtry = c(1:(ncol(dt4) - 2)))
+
+```
+
+Now train the model. The code in the next block is for demonstration purposes and I advice you not to run it during the class. This is because it will take several minutes if not hours to execute.
+
+We derive the model by using `train()` function form `caret`. We first specify the formula, which in our case is `CarInsurance` as a function of all the variable sin the model. Next, we specify the data set to be used. `caret` has numerous machine learning and statistical methods (258 in all). For random forest, we will use `rf` method. With this method, under the hood, `caret` is using `randomForest` package. But note that other alternatives for random forest such as `ranger` are available as well.^[How about you trying out other random forest methods? Check out https://topepo.github.io/caret/train-models-by-tag.html#Random_Forest]
+
+For classification, we will use "Accuracy" as the metric to maximize. Then we provide the tuning grid and training control objects, and finally select the number of trees.^[Note that `caret` does not treat the number of trees as a hyper parameter. Therefore, you can't use it in the tuning grid. If, however, you are really interested in tweaking the number of trees, you should use a for loop.]
+
+**Warning: This will take several minutes or even hours to run!**
+
+```{r eval = FALSE}
+set.seed(9933)
+
+modelRF_large <- train(CarInsurance ~ . , 
+                 data = dt4_train, 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid_large,
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+
+We are getting the highest accuracy when `mtry = 19` so I am going to set `mtry` to 19 for this example. We will execute the code below in the class. However, if you are curious, you could use `mtry = 7` as well given that there is a minor difference between the two accuracies. Furthermore, a smaller number of trees is preferred over a larger number because it is likely to perform better out of sample.
+
+**Run this code in the class instead of the grid search above.**
+
+```{r}
+trControl <- trainControl(method = "cv", 
+                          number = 10, 
+                          search = "grid",
+                          classProbs = TRUE)
+
+tuneGrid <- expand.grid(mtry = 19)
+
+```
+
+
+Next, train the model using the above training controls. 
+
+```{r eval=FALSE}
+set.seed(9999)
+
+modelRF <- train(CarInsurance ~ . , 
+                 data = dt4_train, 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+```{r}
+print(modelRF)
+
+```
+
+Our model has a decent resampling accuracy of 84.2%. Kappa is 0.67, which is also fairly acceptable. ^[In practice Kappa > 0.75 suggests very good model accuracy.]
+
+
+```{r}
+varImp(modelRF, scale = TRUE)
+```
+
+Variance importance suggests that `CallDuration` is the single-most important variable! Let's talk more about this below.
+
+```{r}
+confusionMatrix(predict(modelRF, select(dt4_test, -CarInsurance)), 
+                reference = dt4_test$CarInsurance, 
+                positive = "Yes")
+```
+
+The confusion matrix suggests that our model performs well outside the sample as well. However, the variable importance calculated above suggests that `CallDuration` may have a spurious relationship between the likelihood to buy insurance. This is because when a person is interested in buying the insurance, he/she will spend more time on the call.
+
+**For a purely predictive task, this is not a concern.** If, for example, given all the information in the data set, we want to predict whether a person bought insurance or not, we will do well with the model we built. However, consider this problem from a marketing manager's perspective. The manager wants to know whether it makes sense to even make a call to a customer. Because the real cost here is the cost of contacting a prospective buyer. So in order to reduce the cost of contacting them, they would like to build a model based on the information that does not include calls.
+
+So, `CallDuration` might be a good metric for predicting insurance purchase but it is not a good metric for prescribing who to call. This is because, 1) the call has not happened yet and 2) one can't simply increase the call length and expect the prospect to buy insurance. If call length is the metric to optimize, salespeople will likely game the system and talk nonsense on the phone just to extend the call.
+
+Let's rerun the example after removing the call related variables.
+
+```{r eval = FALSE}
+set.seed(9999)
+
+modelRF2 <- train(CarInsurance ~ . , 
+                 data = select(dt4_train, -starts_with("Call")), 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+
+
+Print the model
+
+```{r}
+print(modelRF2)
+```
+
+
+Now, the model accuracy went down significantly. Let's see which variables are important.
+
+```{r}
+varImp(modelRF2, scale = TRUE)
+```
+
+`Balance`, `Age`, and `LastContactDay` are the three most important variables predicting the likelihood to buy insurance. We do not know the directions of their effects. We will learn more about that in a moment.
+
+Let's see what the new confusion matrix shows us.
+
+```{r}
+confusionMatrix(predict(modelRF2, 
+                        select(dt4_test, 
+                               -CarInsurance,
+                               -starts_with("Call"))), 
+                reference = dt4_test$CarInsurance, 
+                positive = "Yes")
+```
+
+Our model performs really poorly out of sample. In particular, we misclassified about 51% (156 / 320) potential purchases. Note that if the marginal cost of a call is much lower compared to the marginal cost of losing a customer, our model is performing really poorly with only 51% sensitivity. 
+
+However, note that `caret` is using a probability cutoff of 0.5 to determine whether a person will buy insurance or not. We can change that cutoff to 0.3 to see whether we get better results. 
+
+```{r}
+
+predict_custom <- predict(modelRF2, 
+                          select(dt4_test, -CarInsurance, -starts_with("Call")),
+                          type = "prob") %>% 
+  mutate(new_class = factor(ifelse(Yes >= 0.3, "Yes", "No"))) %>% 
+  select(new_class)
+  
+
+confusionMatrix(predict_custom$new_class, 
+                reference = dt4_test$CarInsurance, 
+                positive = "Yes")
+```
+
+
+With a revised cutoff of 0.3, although we now identify too many prospective buyers, we do not unnecessarily leave out a lot of prospective customers. This is also a good lesson for us. We can't improve the overall accuracy of the model just by changing the default cutoff of 0.5.
+
+### Aside: Variable importance using `lime` ^[You may skip this part and move down to see how to tweak the model and data.]
+
+In prescriptive analytics we are also interested in knowing the direction of the effect. For example, we expect that `Balance` is increasing the probability that a person buys insurance. However, `caret` does not tell us whether this is indeed true. In order to tackle this issue, we will use `lime` package. ^[LIME stands for **L**ocal **I**nterpretable **M**odel-agnostic **E**xplanations] I won't be able to go into the details here.
+
+Note that we are using only 20 observations from the `dt4_test` data set to save time.
+
+```{r}
+explainer_rf2 <- lime::lime(select(dt4_train, -starts_with("Call")),
+                            modelRF2,
+                            n_bins = 5) # number of bins for continuous variables
+
+explanation_rf2 <- lime::explain(
+  x = select(dt4_test[1:20, ], -CarInsurance, -starts_with("Call")),
+  explainer = explainer_rf2,
+  n_permutations = 5000, # default
+  dist_fun = "gower",    # default
+  kernel_width = 0.75,   # default
+  n_features = 10,
+  feature_select = "highest_weights",
+  labels = "Yes"         # the label for the event "buy"
+)
+
+```
+
+
+Plot the features
+
+```{r}
+plot_explanations(explanation_rf2)
+```
+
+`lime` shows the results for each case separately. For instance, out of the 20 observations, 16 show increased probability of purchase if `NoOfContacts` is <= 2. Fore more details, please visit https://uc-r.github.io/lime.
+
+
+## Tweaking the model (and data!)
+
+
+We have several tools at our disposal to improve the model performance. My first advice is to use grid search and tune `mtry`. If you have time or a powerful computer at your disposal, tune the number of trees as well. We have fixed it at 1,000.
+
+### Dropping irrelevant variables
+
+We can drop a few less important variables from our model as they might be adding noise. Let's keep only the variables with scaled importance more than 10
+
+```{r}
+impvar <- varImp(modelRF2, scale = TRUE)[[1]] %>% 
+  tibble::rownames_to_column() %>%
+  filter(Overall > 10) %>% 
+  pull(rowname)
+```
+
+Now, `impvar` is a vector with the important variables. The next part will take some time to finish running because I am going to try multiple values of `mtry`. However, as the number of variables is small, this will be much quicker than the larger model above.
+
+```{r eval=FALSE}
+set.seed(9999)
+
+modelRF3 <- train(CarInsurance ~ . , 
+                 data = select(dt4_train, CarInsurance, impvar), 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = expand.grid(mtry = c(1:9)),
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+```{r}
+print(modelRF3)
+```
+
+```{r}
+plot(modelRF3)
+```
+
+Clearly, the solution with `mtry` = 2 is the best in this scenario. Let's see how the model performs out of the sample on the test set.
+
+```{r}
+confusionMatrix(predict(modelRF3, select(dt4_test, impvar)), 
+                reference = dt4_test$CarInsurance, 
+                positive = "Yes")
+```
+
+By dropping the variables we did not increase the accuracy of the model. In fact, the sensitivity is now lower. Therefore, we will not use this model further.
+
+### Balancing classes
+
+Note that the proportion of "Yes" and "No" in our model is not 50:50. 
+
+```{r}
+table(dt4_train$CarInsurance)
+```
+
+
+We can balance these classes and hope to improve classification accuracy. For this we will use `ROSE` function from `ROSE` package.^[Read more about this here: https://journal.r-project.org/archive/2014-1/menardi-lunardon-torelli.pdf]
+
+
+`ROSE` function creates synthetic samples in order to balance the classes. Below, I keep the sample size the same, so in order to balance the two classes, `ROSE` will undersample from "No" and oversample from "Yes". As `ROSE()` returns a list, we retain the data frame that's relevant for us. Also note that we can specify a random number seed in the function.
+
+```{r}
+dt4_train2 <- ROSE::ROSE(CarInsurance ~ .,
+                   data = select(dt4_train, -starts_with("Call")),
+                   N = 3201,
+                   p = 0.5,
+                   seed = 305)$data
+```
+
+
+Check the class balance.
+
+```{r}
+table(dt4_train2$CarInsurance)
+```
+
+Now the two classes are almost equally balanced. Let's use the new synthetic sample.
+
+```{r eval = FALSE}
+set.seed(9999)
+
+modelRF4 <- train(CarInsurance ~ . , 
+                 data = dt4_train2, 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid,
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+
+```{r}
+print(modelRF4)
+```
+
+Wow, look at that! By using synthetic sampling, we increased the accuracy of our model to 92.2%. But does that also help us improve the out-of-sample performance?
+
+
+```{r}
+confusionMatrix(predict(modelRF4, select(dt4_test, -CarInsurance, -starts_with("Call"))), 
+                reference = dt4_test$CarInsurance, 
+                positive = "Yes")
+```
+
+Looks like our new model has worse out-of-sample performance. :anguished: 
+
+**This station where you have an improved in-sample performance but a worse out-of-sample performance is known as overfitting**. 
+
+Due to the poor predictive power of the model built on synthetic sample, let's go back to our original model, `modelRF2` for the rest of the analysis.
+
+
+## Making prescriptions
+
+In this section, we will use our predictive model to get probabilities for a set of potential customers. we will then use those probabilities to create segments to target.
+
+First, get the list of prospects. 
+
+```{r}
+prospects <- read.csv("https://raw.githubusercontent.com/ashgreat/datasets/master/carInsurance_test.csv",
+                      stringsAsFactors = FALSE)
+```
+
+We will have to perform the same adjustments that we did on the training data.
+
+```{r}
+prospects2 <- prospects %>% 
+  mutate(CallStart = lubridate::hms(CallStart),
+         CallEnd  = lubridate::hms(CallEnd),
+         CallStartHour = hour(CallStart),
+         CallStartMin = minute(CallStart),
+         CallStartSec = second(CallStart),
+         CallEndHour = hour(CallEnd),
+         CallEndMin = minute(CallEnd),
+         CallEndSec = second(CallEnd),
+         CallDuration = lubridate::period_to_seconds(CallEnd) - lubridate::period_to_seconds(CallStart)) %>% 
+  select(-CallStart, -CallEnd) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(Communication = ifelse(is.na(Communication), "Not Available", Communication),
+         Outcome = ifelse(is.na(Outcome), "None", Outcome),
+         DaysPassed = ifelse(DaysPassed == -1, 1000, DaysPassed))
+
+```
+
+Impute missing values as before.
+
+```{r eval = FALSE}
+set.seed(8934)
+
+miceMod2 <- mice::mice(subset(prospects2, select = -CarInsurance), 
+                      method = "rf")
+
+```
+
+
+Generate the completed data, create dummy variables, and convert `CarInsurance` to a factor.
+
+```{r}
+
+prospects3 <- mice::complete(miceMod2)
+
+
+prospects3$CarInsurance <- prospects2$CarInsurance
+
+prospects4 <- predict(dummyVars(CarInsurance ~ .,
+                         data = prospects3,
+                         fullRank = TRUE),
+                      newdata = prospects3) %>% 
+  data.frame()
+
+prospects4$CarInsurance <- prospects2$CarInsurance
+
+prospects4 <- prospects4 %>% 
+  mutate(CarInsurance = as.factor(ifelse(CarInsurance == 0, "No", "Yes")))
+
+```
+
+
+Predict probabilities of insurance purchase using `modelRF2`.
+
+```{r}
+
+pred_prob <- predict(modelRF2,
+                     select(prospects4, -Id, -starts_with("Call")),
+                     type = "prob")
+```
+
+
+Plot these probabilities
+
+```{r}
+
+ggplot(pred_prob, aes(x = Yes)) +
+  geom_histogram() +
+  theme_minimal()
+
+```
+
+Looks like the histogram is positively skewed, which suggests that many people on the list are unlikely to buy. However, marketers don't have to stick to the 50% probability cutoff. Instead, we can prescribe cutoffs based on our own experience in the past. For instances, we can use a rule to create segments for targeting. Here I give you a few examples:
+
+1. Call the prospects with at least 70% probability right away.
+
+2. For the prospects with probabilities between 20% and 70%, use expert salespersons to call.
+
+3. Ignore all the prospects with less than 20% probability.
+
+Clearly, these cutoffs seem arbitrary. In reality, such decisions are made after some brainstorming and doing some experimentation.
+
+This is the end of the exercise. ^[What other prescriptions can you give to the company?]
+
