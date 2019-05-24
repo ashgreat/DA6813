@@ -1,0 +1,315 @@
+---
+title: "Event study"
+author: "Ashwin Malshe"
+date: "5/8/2019"
+output: html_document
+---
+
+# Event Study
+
+Event studies are popular in finance research. The method is old and yet quite robust even today. The core assumption underlying an event study is that the stock markets are "informationally efficient". Current stock prices reflect all the publicly available information and the stock prices adjust quickly to the release of all new public information that is value relevant.^[This is know as semi-strong form of market efficiency.] If you want to know more about market efficiency, I suggest reading this article: https://www.investopedia.com/terms/s/semistrongform.asp
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+## Mechanics of event studies
+
+An event study looks at an event that was unexpected and quantifies the impact of that event on the stock prices. The event will be value relevant only if it moves the stock price more than what was expected by the market. In order to determine whether an event is value relevant, we need to have a benchmark against which we can measure the stock price movement.
+
+### The benchmark
+
+The most common benchmark used in finance is the Fama-French (FF) 3-factor asset pricing model. The model is a modified version of more famous and theory-rich Capital Asset Pricing Model (CAPM).^[William Sharpe won the Nobel Memorial Prize in Economics for CAPM.] FF model asserts that the stock prices are determined by 3 risks: market risk, size risk, and value risk. FF model for a stock $i$ in time $t$ is given by
+
+$$ ExcessRet_{it} = \beta_{MKT}*MktRF_{it} + \beta_{SMB}*SMB_{it} + \beta_{HML}*HML_{it} $$
+where, $ExcessRet_{it}$ is the stock's return above the risk-free return, $MktRF_{it}$ is the market return above risk-free return, $SMB_{it}$ is the "size factor", and $HML_{it}$ is the "value factor".^[We will not get into the details of these factors but you can read more about them from [Kenneth French's website](http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/f-f_5_factors_2x3.html).]
+
+$\beta_{MKT}$, $\beta_{SMB}$, and $\beta_{HML}$ are the measures of market, size, and value risks, respectively. As long as we have estimates of these risks^[Call them $\hat{\beta}_{MKT}$, $\hat{\beta}_{SMB}$, and $\hat{\beta}_{HML}$], we can use them to obtain **expected** stock returns in time $t+k$ by observing $MktRF_{it+k}$, $SMB_{it+k}$, and $HML_{it+k}$ as follows:
+
+$$ \widehat{ExcessRet}_{it+k} = \hat{\beta}_{MKT}*MktRF_{it+k} + \hat{\beta}_{SMB}*SMB_{it+k} + \hat{\beta}_{HML}*HML_{it+k} $$
+
+Thus, $\widehat{ExcessRet}_{it+k}$ is our benchmark against which we will compare the realized stock returns. If the realized returns are statistically not distinct from the expected returns, we conclude that the event was not value relevant.
+
+## Steps for an event study
+
+We have to perform the following steps:
+
+1. Obtain estimates of the risks by regressing daily stock returns on the risk factors. Usually we use returns from the past 250 trading days (1 calendar year).
+
+2. Use the risk estimates and risk factors on the day of the event to estimate expected stock returns.
+
+3. Test whether the realized stock returns are statistically different from expected stock returns. Note that the expected stock returns will be estimated with their prediction intervals. As long as the realized stock returns do not fall in the prediction interval, we can conclude that the event is likely to be value relevant.
+
+We now turn to doing an event study analysis.
+
+## Case study of Donald Trump's Twitter attacks
+
+The current US President, Donald Trump, often attacks companies on Twitter. Many people object to this because they fear that the companies' stock prices will be affected adversely. However, whether Trump's Twitter attack are seriously damaging to the stock prices is an empirical question. Assuming that Trump's attacks are unexpected events, we can use event study methodology to answer it.
+
+I used a [CNN article](https://money.cnn.com/2018/04/04/news/companies/trump-companies-attacks/index.html) that listed 17 such attacks as of April 2018. I picked 13 of these for the event study. I left out a few cases where the company under attack was not traded publicly but their parent company was.
+
+
+Based on this, let's create a data frame that will hold the 13 events.
+
+```{r}
+events <- data.frame(Company = c("Amazon", "Boeing", "CBS", "Comcast",
+                       "Delta", "Facebook", "General Motors",
+                       "Lockheed Martin", "Merck", "New York Times",
+                       "New York Times", "Nordstrom", "Toyota"),
+           Ticker = c("AMZN", "BA", "CBS", "CCZ", "DAL", "FB",
+                      "GM", "LMT", "MKGAF", "NYT", "NYT", "JWN", "TM"),
+           Date_Attacked = as.Date(c("2018-04-02", "2016-12-06",
+                                       "2017-02-17", "2017-11-29",
+                                       "2017-01-30", "2017-10-21",
+                                       "2017-01-03", "2016-12-22",
+                                       "2017-08-14", "2017-02-17",
+                                       "2017-01-28", "2017-02-08",
+                                       "2017-01-05")))
+```
+
+These 13 events are as follows:
+
+```{r trump-attack, echo=FALSE}
+ events  %>% 
+  knitr::kable(caption = "Trump Twitter Attacks",
+               booktabs = TRUE)
+```
+
+
+## Doing the event study
+
+Start with loading the required packages. In order to get stock data, we will use a specialized package called `BatchGetSymbols` available on CRAN.
+
+```{r error=FALSE, warning=FALSE, message=FALSE}
+
+# install.packages(c("BatchGetSymbols", "data.table", "reshape2"))
+
+library(BatchGetSymbols) # to get the stock data
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(data.table)
+library(purrr)
+library(psych)
+library(reshape2)
+library(caret)
+```
+
+
+Download stock price data using the `events` data frame. We specifically need the ticker symbols of the stocks.^[A ticker symbol is a short code used for identifying a company's stock.] We will collect stock returns 400 days prior to the event and 15 days post event. We are not going to use all the data but if you are downloading it once, it is better to download more rather than less.
+
+The function `BatchGetSymbols()` returns a list. One of the elements of the list is the data frame consisting of the stock prices. Rather than writing complicated code in the loop, we will simply store the entire list as an element of a larger list `stkprc`. Then we will keep storing downloaded lists in this larger list. 
+
+```{r eval=FALSE}
+
+stkprc <- list()
+
+for (i in 1:nrow(events)) {
+  stkprc[[i]] <- BatchGetSymbols(
+                  tickers = events$Ticker[i],
+                  first.date = (events$Date_Attacked[i] - 400),
+                  last.date = (events$Date_Attacked[i] + 15),
+                  freq.data = "daily"
+                  )
+}
+
+```
+
+
+`stkprc` is a list of lists as each one of its elements is a list of 2 more elements. Next we need to create another list `price_dt` where we will only hold the dataframe with stock prices. Also, we need to create a variable that holds the information about the trading days from the event date. This is slightly more complicated than just taking the difference between two dates. This is because the stock market is not open on all the days. In the code below, I used `which()` function from base R to return the row number where the event date rests in the downloaded stock returns data. This has to be done for each of the 13 stocks and therefore, we use a `for` loop. Note that we create a variable `event_diff` which is the difference between the row number of a given date and the row number of the event date that we calculated earlier.
+
+
+```{r error=FALSE}
+
+price_dt <- list()
+
+for (i in 1:nrow(events)) {
+  event_pos <- which(stkprc[[i]]$df.tickers$ref.date == 
+                     events$Date_Attacked[i])
+  price_dt[[i]] <- tryCatch(stkprc[[i]]$df.tickers %>% 
+    mutate(event_diff = row_number() - event_pos),
+    error = function(x) {
+    message(x)
+    return(NA)
+    })
+}
+```
+
+
+You probably noticed that there is a `tryCatch()` function used above. As it turns out, there were 2 events which did not take place on the day when stock markets were open. This means for these stocks, `event_pos` was `NA` and `event_diff` could not be computed. We could move the event date for these two stocks by a day or two. However, for this exercise we will refrain from doing that because there might be other events happening the next day, which will affect the stock prices. 
+
+The next two lines of code will remove the blank list elements.
+
+```{r}
+price_dt[[which(is.na(price_dt))[1]]] <- NULL
+price_dt[[which(is.na(price_dt))[1]]] <- NULL
+```
+
+Finally, we will stack all the 11 data sets and create one single data frame.^[I love using `data.table` for this. Check out https://www.ashwinmalshe.com/post/speed-comparison-rbind/]
+
+```{r}
+price_stakced <- data.table::rbindlist(price_dt)
+```
+
+Get the frequency distribution of tickers to make sure that we actually stacked 11 data sets.
+
+```{r}
+table(price_stakced$ticker)
+```
+
+Looks good.
+
+## Fama-French factors
+
+Fama-French factors are available from [Kenneth French's website](http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html). We will use Fama-French 5 factors daily file. More description on what these factors are is available [here](http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/f-f_5_factors_2x3.html).
+
+I earlier downloaded and cleaned up the CSV file a little bit for easy operation. You can download it from this link: http://bit.ly/2V5euiB or you can directly read it as follows.
+
+```{r}
+ff <- read.csv("http://bit.ly/2V5euiB") %>% 
+  mutate(Date = lubridate::ymd(Date)) %>% 
+  mutate_if(is.numeric, function(x) x / 100)
+```
+
+We divided all the returns by 100 to correctly convert them into fractions. Take a look at the data set.
+
+```{r}
+
+head(ff)
+```
+
+
+Next, we will merge Fama-French factors with `price_stacked`.
+
+```{r}
+price_merge <- price_stakced %>% 
+  inner_join(ff, by = c("ref.date" = "Date")) %>% 
+  mutate(ret = ret.adjusted.prices - RF)
+```
+
+`ret` is $ExcessRet_{it}$
+
+## Parameter estimates
+
+We will first use linear regression to obtain parameter estimates. In the following code we will run regression model separately for each company and save them in a large list called `lm_list`
+
+```{r}
+lm_list <- price_merge %>% 
+  filter(-260 <= event_diff & event_diff < -10 ) %>% 
+  split(.$ticker) %>% 
+  purrr::map(~ lm(ret ~ MktRF + SMB + HML + RMW + CMA, data = .))
+```
+
+Note that we could have simply extracted the coefficients from each linear regression to calculate predicted returns manually. However, we will need the prediction intervals and base R's `predict()` function produces them automatically.
+
+## Predict stock return on the event day
+
+First, keep only the event days.
+
+```{r}
+pred_dt <- price_merge %>% 
+  filter(event_diff == 0)
+```
+
+
+Next, make the predictions and store them in a dataframe called `predictions`. Note that `predict()` function, when used with the argument `interval` will output 3 values labeled as `fit`, `lwr`, and `uhr`. The last two are the lower and upper prediction intervals, respectively.
+
+```{r}
+
+predictions <- structure(list(fit = numeric(),
+                              lwr = numeric(),
+                              upr = numeric()),
+                         class = "data.frame")
+
+for (i in 1:length(lm_list)) {
+  predictions <- rbind(predictions,
+                       predict(lm_list[[i]],
+                               pred_dt[i, ],
+                               interval = "predict")
+                       )
+}
+
+```
+
+
+Finally, add the columns for real returns (adjusted for the risk-free returns) and ticker.  
+
+```{r}
+predictions <- predictions %>% 
+  mutate(ticker = pred_dt$ticker,
+         ret = pred_dt$ret)
+```
+
+## Plotting the returns
+
+We will now plot the returns for easy comparison. The best way to depict these returns will be by using a scatterplot superimposed on the error bars corresponding to the lower and upper prediction intervals.
+
+We will first create a data set that is reshaped to be long. As the realized returns do not have the prediction intervals, we will drop these variables for the time being.
+
+```{r}
+predictions_lg <- predictions %>% 
+  select(ticker, ret, fit) %>% 
+  reshape2::melt(id.vars = "ticker")
+```
+
+Take a look at this data using `headTail()` function from `psych` package, which will print 4 observations from the top and 4 observations from the bottom by default.
+
+```{r}
+psych::headTail(predictions_lg) %>% 
+  knitr::kable(caption = "Reshaped Predictions",
+               booktabs = TRUE)
+```
+
+
+Now make the plot.
+
+```{r trump-event, fig.cap="Stock Reactions to Trump Attacks"}
+ggplot(predictions_lg, aes(x = ticker)) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), 
+           data = predictions,
+           color = "#03c3f6",
+           width = 0.2) +
+  geom_point(aes(y = value, 
+                 fill = variable), 
+             color = "#3b4252",
+             shape = 21) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#ef2e69", 
+                               "#205aff"),
+                    labels = c("Realized Returns",
+                               "Estimated Returns")) +
+  labs(x = "Ticker",
+       y = "Daily Stock Returns", 
+       fill = "") +
+  theme_minimal()
+  
+```
+
+
+Interestingly, except for Amazon, no other stock suffered from Trump attack! Nordstrom actually showed an unexpected increase in the stock price. Otherwise, rest 9 stocks have no effect of Trump Twitter attack.
+
+## FF model efficacy
+
+On one hand it is good to know that Trump's attacks are not hurting shareholder value. On the other hand, we might be wrong to conclude this because our analysis totally relies on the efficacy of the FF model as a solid benchmark. Given the large prediction intervals above, I am not sure the model has done a good job of capturing the real risk measures! They look very noisy to me.
+
+We can quickly check the R^2^ of the regression models to figure out how well FF model described the stock prices over a year.
+
+```{r}
+price_merge %>% 
+  filter(-260 <= event_diff & event_diff < -10 ) %>% 
+  split(.$ticker) %>% 
+  map(~ lm(ret ~ MktRF + SMB + HML + RMW + CMA, data = .)) %>% 
+  map(summary) %>% 
+  map_dbl("r.squared")
+```
+
+Looks like the R^2^ range from just 1.67% (CCZ and MKGAF) to 53% (NYSE). So, at least in some cases our benchmark model was not very good. Perhaps we can improve the model by using nonlinear transformations of the variables. You could also try other machine learning models such as Random Forest and Support Vector Machine. However, a major issue while doing cross-validation for these models on the training data is that you will lose the time-series aspect. Although we are not using the time-series property of data in the linear model either, we are strictly forecasting in future. With cross-validation, the model can be predicting past values based on the future values! So even when the model may perform well in sample, it might be meaningless for predicting future values.
+
+## Summary
+
+This exercise showed you how to do event study. Although this was a basic example, it conveys the importance of event study methodology. The critical aspect of an event study is that we are required to have a benchmark, which typically is a factor model such as Fama-French 3 or 5 factor model. Whether this model is the best benchmark is certainly up for a debate.
+
+Using event study methodology we showed that Donald Trump's Twitter attacks on brands are not necessarily leading up to shareholder value loss. Although we found that Amazon shareholders were harmed by Trump tweet, other brands did not have any negative impact.
