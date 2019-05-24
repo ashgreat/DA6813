@@ -1,0 +1,314 @@
+---
+title: "Titanic"
+author: "Ashwin Malshe"
+date: "5/6/2019"
+output: html_document
+---
+
+# Classifying Titanic Survivors
+
+In machine learning applications, one of the first exercises is to build a model to classify Titanic survivors. The exercise has a little practical value beyond being a learning exercise. However, there are a lot of interesting findings from this data set.
+
+Kaggle hosted a competition using Titanic data a while back, and it is accessible here: https://www.kaggle.com/c/titanic/data
+
+
+You can also download CSV files from my Github repository: https://github.com/ashgreat/datasets. We will use these links in the code.
+
+
+The objectives of this exercise are as follows:
+
+1. Use binary logistic regression model to classify survivors and deaths
+
+2. Use XGBoost to classify survivors and deaths
+
+
+## Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Let's start with loading required packages.
+
+```{r message=FALSE, warning=FALSE, error=FALSE}
+
+# install.packages(c("mice", "psych", "doParallel"))
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(mice)
+library(psych)
+library(doParallel)
+```
+
+
+Read Titanic training and test data files.
+
+```{r}
+titanic_train <- read.csv("https://raw.githubusercontent.com/ashgreat/datasets/master/titanic_train.csv")
+titanic_test <- read.csv("https://raw.githubusercontent.com/ashgreat/datasets/master/titanic_test.csv")
+```
+
+
+We will use `titanic_train` for model building and then, if you wish, test the efficacy of the model using `titanic_test`. However, `titanic_test` doesn't have the true values of the dependent variables `survived`. To know whether your classification is good, you will have to submit it on Kaggle and get the score.
+
+Let's find the structure of the data and what it contains.
+
+```{r}
+str(titanic_train)
+```
+
+Note that `PassengerId`, `Name`, `Ticket`, and `Cabin` seem like variables that we will not use in modeling. However, as we will see below there is a possibility for using information contained in `Name`. Also notice that `Embarked` has 4 levels but one of them is blank. Take a look at its distribution:
+
+```{r}
+table(titanic_train$Embarked)
+```
+
+As only 2 values are missing, we should either drop these observations or we should impute them. An easy fix is to replace them by the mode of the distribution, which is `S`.
+
+```{r}
+titanic_train <- titanic_train %>% 
+  mutate(Embarked = factor(ifelse(Embarked == "", "S", as.character(Embarked))))
+```
+
+
+
+The variable description from Kaggle is as follows:
+
+```{r}
+
+data.frame(Variable = c("survival", "pclass", "sex", "Age", "sibsp", "parch", "ticket", "fare", "cabin", "embarked"),
+           Definition = c("Survival", "Ticket class", "Sex", "Age in years", "# of siblings / spouses aboard the Titanic", "# of parents / children aboard the Titanic", "Ticket number", "Passenger fare", "Cabin number", "Port of Embarkation"),
+           Key = c("0 = No, 1 = Yes", "1 = 1st, 2 = 2nd, 3 = 3rd",
+                   "","","","","","","","C = Cherbourg, Q = Queenstown, S = Southampton")
+) %>% 
+  knitr::kable()
+
+
+
+```
+
+Also, Kaggle provides more information on the variables as follows: 
+
+**Variable Notes**
+
+**Pclass**: A proxy for socio-economic status (SES)
+1st = Upper
+2nd = Middle
+3rd = Lower
+
+**Age**: Age is fractional if less than 1. If the age is estimated, is it in the form of xx.5
+
+**Sibsp**: The dataset defines family relations in this way...
+Sibling = brother, sister, stepbrother, stepsister
+Spouse = husband, wife (mistresses and fiancés were ignored)
+
+**Parch**: The dataset defines family relations in this way...
+Parent = mother, father
+Child = daughter, son, stepdaughter, stepson
+Some children travelled only with a nanny, therefore parch = 0 for them.
+
+
+### Missing values
+
+```{r, warning=FALSE}
+psych::describe(titanic_train) %>%
+  select(-vars, -trimmed, -mad, -range, -se) %>% 
+  knitr::kable() # kable prints nice-looking tables.
+```
+
+Only `Age` has missing values. This makes our job quite easy. We will not throw away the missing observations. Instead, we will impute them using random forest. We don't have to do it manually. Instead, we will use `mice()` function from `mice` package.
+
+```{r}
+set.seed(9009)
+
+miceMod <- mice::mice(subset(titanic_train, 
+                             select = -c(Survived, PassengerId, Name, Cabin, Ticket)), 
+                method = "rf")  # perform mice imputation based on random forest.
+
+```
+
+
+Build a complete dataset and add back 4 variables that we removed previously. Also convert `Survived` into a factor with more explicit labels.
+
+```{r}
+titanic_train2 <- mice::complete(miceMod) %>% 
+  mutate(Name = titanic_train$Name,
+         Cabin = titanic_train$Cabin,
+         Tiket = titanic_train$Ticket,
+         Survived = factor(ifelse(titanic_train$Survived == 1, "Survived", "Diseased")))
+```
+
+
+Check whether there are any missing values
+
+```{r}
+anyNA(titanic_train2)
+```
+
+There are no missing values any more.
+
+Note that we did not use `Name` and `Cabin` to impute missing `age` because there is likely to be little information in these variables. But, interestingly, `Name` also contains the person's title, which can be extracted and used for model building. It can be a relevant variable in particular if it contains information that is not captured by other variables. I am refraining from doing it in order to keep this exercise short. Furthermore, it seems that adding these variables doesn't materially improve prediction accuracy. This is probably because these variables are associated with `Pclass`, `Sex`, and `Fare`.^[There are several solutions to Titanic contest online. You can check their code to see how they used these variables in their model.]
+
+## Training and test sets
+
+Although Kaggle provided us with both training and test sets, we can't actually use the test set for model evaluation. Therefore, we must create our own test set. We will use `createDataPartition()`  from `caret` package to create an index of row numbers ot keep in the training set. The rest will go in the test set.
+
+```{r}
+set.seed(5555)
+index <- caret::createDataPartition(titanic_train2$Survived, 
+                                      p = 0.8,
+                                      list = FALSE) # Caret returns a list by default.
+```
+
+
+```{r}
+
+t_train <- titanic_train2[index,]
+t_test <- titanic_train2[-index,]
+
+```
+
+The great aspect of `createDataPartition` is that it keeps the proportion of the classes in the specified variables the same in the two data sets. Let's take a look:
+
+```{r}
+
+table(titanic_train2$Survived) / length(titanic_train2$Survived)
+table(t_train$Survived) / length(t_train$Survived)
+table(t_test$Survived) / length(t_test$Survived)
+
+```
+
+
+## Logistic regression
+
+We will first use binary logistic regression for model building using `t_train` data and then assess its performance using `t_test` data. For this we will use `caret` package although base R has `glm()` function which will also suffice.
+
+```{r}
+
+m1 <- caret::train(Survived ~ .,
+                   data = t_train[, -c(8:10)], # Drop Name, Ticket, and Cabin
+                   method = "glm",
+                   family = binomial()) 
+
+summary(m1)
+```
+
+If you have seen the movie Titanic, perhaps you know that the ship's captain followed certain rules for evacuation. Women and children got to go first, and therefore, had a very high chance of survival. On the othe rhand, men from 3^rd^ class had almost no chance of survival. 
+
+We get to see that playing out in the data. As `Pclass` increases, probability of survival drops. We will have to compute the odds ration to quantify this. Similarly, males on average had much smaller chance of survival compared to females. Next, younger passenger had a much higher chance of survival compared to an older passenger. Interestingly, peole with siblings and/or spouse on Titanic had lower probability of survival! I don't know the reason for this.
+
+
+### Model performance
+
+Let's check out the performance of the model out of the sample using `t_test` data set. For this, we will use `confusionMatrix()` function from `caret` package.
+
+```{r}
+caret::confusionMatrix(predict(m1, 
+                               subset(t_test, select = -Survived)),
+                       reference = t_test$Survived,
+                       positive = "Survived")
+```
+
+It's a simple model and yet quite good! In most cases people were getting accuracies in low 80%s so we are not doing bad at all.^[Extension for you to try: Using interactions between variables (e.g., `Sex` and `Age`), check whether you can improve the accuracy of the model.]
+
+## XGBoost
+
+The next model that we will consider is XGBoost. We will first set training controls. For more information please read `caret` documentation.
+
+```{r}
+
+trControl <- trainControl(method = "cv",
+                          number = 5,
+                          verboseIter = FALSE,
+                          classProbs = TRUE,
+                          summaryFunction = twoClassSummary,
+                          savePredictions = TRUE,
+                          allowParallel = TRUE)
+
+```
+
+Next, we will create a hyperparameter tuning grid. Hyperparameters are specific to a model. For instance, in the logistic regression, there is no hyperparameter to tune. However, in most machine learning techniques there will be hyperparameters and we have to find their optimal levels. Usually, the preferred method for that is grid search because the model is far too complex to have a closed form.
+
+For XGBoost tree, the important hyperparameters to tune are as follows:
+
+`eta`($\eta$): This is also known as the learning rate. `eta` shrinks the weights associated with features/variables so this is a regularization parameter. $\eta \in [0, 1]$
+
+`gamma` ($\gamma$): This is the minimum loss reduction that is required for further partitioning a leaf node. Thus, larger values of `gamma` are going to make model more conservative. $\gamma \in [0, \infty]$
+
+`max_depth`: Maximum depth of a tree. A deeper tree is more complex and might overfit.
+
+`min_child_weight`: From XGBoost documentation^[https://xgboost.readthedocs.io/en/latest/parameter.html] - *Minimum sum of instance weight (hessian) needed in a child. If the tree partition step results in a leaf node with the sum of instance weight less than min_child_weight, then the building process will give up further partitioning. In linear regression task, this simply corresponds to minimum number of instances needed to be in each node. The larger `min_child_weight` is, the more conservative the algorithm will be.* `min_child_weight` $\in [0, \infty]$
+
+`colsample_bytree`: The parameter that determines subsampling of variables. `colsample_bytree` $\in [0, 1]$
+
+`subsample`: This is the percentage of observations to be used for training in each boosting interation. The default is 1.
+
+`nrounds`: This controls the maximum number of iterations. For classification, this is equivalent to the number of trees to grow.
+
+
+```{r}
+tuneGrid <- expand.grid(nrounds = seq(10, 100, 10),
+                        max_depth = seq(2, 8, 1),
+                        eta = c(0.1, 0.2, 0.3),
+                        gamma = 10^c(-1:3),
+                        colsample_bytree = seq(0, 1, 0.2),
+                        min_child_weight = 1,
+                        subsample = 1)
+
+```
+
+
+
+The next piece of code will do the model training using the controls and grid we creates. Note that `tuneGrid` object has 6,300 rows, meaning that the model will be estimated 6,300 times. However, that's not the end of it. We also specify 5-fold cross-validation, which means the model will actually be estimated for 31,500 times! So this will likely take a lot of time. I strongly recommend not doing this in the class. To speed up the model execution, we will opt for parallel processing. For this we will use `doParallel` package. In the code below, input th enumber of cores you want to use for parallel processing. This will depend on your computer.
+
+**Warning: This code might take several minutes to execute depending on your computer!**
+
+```{r eval = FALSE}
+
+# Don't run this code in the class
+
+cl <- makePSOCKcluster(6)
+registerDoParallel(cl)
+
+set.seed(888)
+
+m2 <- train(Survived ~. ,
+            data = t_train[, -c(8:10)], # Drop Name, Ticket, and Cabin
+            method = 'xgbTree',
+            trControl = trControl,
+            tuneGrid = tuneGrid)
+
+stopCluster(cl) # Turn off parallel processing and free up the cores.
+registerDoSEQ()
+
+```
+
+
+Next we will use these parameters to build the model in the class.
+
+```{r}
+
+m3 <- train(Survived ~. ,
+            data = t_train[, -c(8:10)], # Drop Name, Ticket, and Cabin
+            method = 'xgbTree',
+            trControl = trControl,
+            tuneGrid = data.frame(nrounds = 30,
+                                  max_depth = 2,
+                                  eta = 0.2, 
+                                  gamma = 0.1,
+                                  colsample_bytree = 1,
+                                  min_child_weight = 1, 
+                                  subsample = 1))
+
+```
+
+
+```{r}
+confusionMatrix(predict(m3, subset(t_test, select = -Survived)),
+                reference = t_test$Survived,
+                positive = "Survived")
+```
+
+Turns out that XGBoost did only about as good as logistic regression. This just goes on to show that logistic regression in many cases is still a good algorithm to use.^[What changes can you make to your logistic regression model so that it produces better predictions?]
