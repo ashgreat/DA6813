@@ -1,0 +1,378 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Copy and paste this line in your concole. Then execute it.**
+
+install.packages("recommenderlab")
+
+
+```{r message=FALSE, warning=FALSE}
+
+library(recommenderlab)
+library(ggplot2)
+library(dplyr)
+```
+
+
+# Collaborative Filtering
+
+Collaborative filtering (CF) is a method used in building recommender systems on big data. Common applications include Amazon product recommendations, Netflix movies and shows recommendations, iTunes music recommendations, etc. CF uses a user-item rating matrix, which contains rating given by users to items. Beyond this, CF does not require other user information such as demographics (e.g., age, sex, etc.) or item information (e.g., movie genre, type of music, etc.). This is a key strength of CF because it relies on minimal information and doesn't raise major privacy concerns as it does not need to know any personal information about the user outside their previous behavior. CF doesn't rely on the content analysis of the items, which makes it easy to build recommenders for applications which may otherwise require complex machine learning models. For instance, CF can be used to recommend jokes without actually knowing what those jokes are!
+
+As the name suggests, the "collaborative" part means that the method relies on behavior by other users with similar tastes. The user-item rating matrix does not explicitly show which users are similar or which items are similar. The objective of Cf is then to identify these similarities. 
+
+### An example
+
+Imagine that you and your friend A decide to meet for lunch. Two of you go to a restaurant where you have not eaten before. But A visits this place often because it's close to her office. You are seated at a table and the server leaves you with menus. You are unsure about what to order so you turn to your friend for suggestions. A recommends a new vegetarian burger called "Beyond burger". How likely are you to try this burger if...
+
+1. You and your friend A have very similar preferences for food
+
+2. You and your friend A have not so similar preferences for food
+
+I guess that you are more likely to order Beyond burger in the first case, that is, when you and A have very similar food preferences. This is in essence what CF entails. However, rather than recommending an item based on only 1 other user's experience, CF uses a lot of users to make more reliable prediction. Think about it as an app that has food preferences of all your friends. This app can recommend you food items by taking into account the evaluations of all the friends with similar taste as you.
+
+## Types of collaborative filtering
+
+In this exercise, we will see many types of CF methods. I briefly describe this methods below.
+
+1. User-based collaborative filtering (UBCF): UBCF relies on the assumption that users with similar preferences in the past will have similar preferences in the future. Thus, if we know that two users have given very similar ratings to a set of movies, we can use the movie rating from one user to predict the rating from the second user on a yet unseen movie.
+
+2. Item-based collaborative filtering (IBCF): IBCF relies on the assumption that a user will prefer an item which is similar to the items they have previously liked. For instance, if you like comedies, IBCF will recommend you more comedies in future.
+
+3. Popularity based collaborative filtering: In this case CF simply recommends a list of popular items. These recommendations are not tailored to any specific user.
+
+4. Singular Value Decomposition based collaborative filtering (SVD): CF using SVD are not exactly using SVD but instead they are using a method that is quite similar to SVD. SVD is a matrix factorization method, which can be used for dimensionality reduction. SVD based CF identifies latent factors that group similar users and similar items. This reduces the burden on recommender dealing with really large amounts of data. Consider that Netflix has hundreds of millions of users and thousands if not millions of movie and show titles.
+
+In 2006, Netflix ran a [recommender contest](https://netflixprize.com) with \$1 million first prize. The contest led to a lot of enhancement in collaborative filtering methods. One such enhancement is Funk SVD due to Simon Funk.^[https://sifter.org/simon/journal/20061211.html] You can read a simplified explanation on [this Medium blog](https://medium.com/datadriveninvestor/how-funk-singular-value-decomposition-algorithm-work-in-recommendation-engines-36f2fbf62cac). Luckily `recommenderlab` implements Funk SVD as well. 
+
+
+## A note on sparsity of rating matrix
+
+The user-item rating matrix is a sparse matrix because most people do not provide ratings. Think about how many times you provided any ratings on Amazon or Netflix! Therefore, most cells of a rating matrix have missing values.
+
+A way to improve upon this situation is to use 1-0 rating scheme whereby if a user engages with an item (buys a book, watches a movie, listens to a song), we fill the cell with 1 and otherwise it is filled with 0. This still does not solve the problem because a 0 has more than one meaning. You may not watch a movie because you don't like something about the movie (genre, actors) or you are simply not aware that the movie exists.
+
+We will side-step this concern for the current exercise. In reality, you will have to find ways to address this because your recommender efficacy depends on it. Ideally you would like to recommend an item that the user is likely to appreciate and engage with.
+
+
+## `recommenderlab` package
+
+We will use `recommenderlab` package to build recommender systems. This package is designed for testing recommender systems in the lab setting rather than in the production setting. The package is available on CRAN.
+
+
+### MovieLense data
+
+We will use MovieLense data, which is bundled with `recommenderlab`. MovieLense has user ratings for movies ranging from 1 to 5, where 5 means excellent.
+
+We can load the data by using `data()` function.
+
+```{r}
+data("MovieLense")
+```
+
+
+```{r}
+class(MovieLense)
+```
+
+We have never seen an object of class `realRatingMatrix` before. This is because this is a class that is defined by the package `recommenderlab`. Let's take a look at the structure.
+
+```{r}
+str(MovieLense, vec.len = 2)
+```
+
+`MovieLense` looks like a list but we usually reference the list elements using `\\$` sign rather than `\\@` sign. So what seems to be different about `realRatingmatrix`? According to the documentation, `recommenderlab` is implemented using formal classes in the S4 class system.^[Read more about S4 class here: http://adv-r.had.co.nz/OO-essentials.html] We can formally check it using `isS4()` function from base R.
+
+```{r}
+isS4(MovieLense)
+```
+
+As this is a new class for us, it is important to understand the methods that are applicable to this class. We can use `methods()` function from `utils` package in base R to achieve this.
+
+```{r}
+methods(class = class(MovieLense))
+```
+
+Looks like `realRatingMatrix` has several methods associated with it. For example, it can calculate row and column counts directly by using `rowCounts()` and `colCounts()` functions, respectively. Similarly, there is `normalize()` function, which can be used to mean center user ratings.
+
+
+## Explore `data` from `MovieLense`
+
+```{r}
+dim(MovieLense@data)
+```
+
+MovieLense has ratings by 943 people on 1,664 movies. 
+
+```{r}
+# Total number of ratings. Has to match the total number of cells (943*1664 = 1,569,152)
+sum(table(as.vector(MovieLense@data)))
+
+```
+
+
+Let's now check what kind of ratings are contained in `data` matrix. 
+
+```{r}
+table(as.vector(MovieLense@data))
+```
+
+The rating corresponding to 0 is actually a missing rating. Indeed, this is a sparse matrix with only about 99,000 actual ratings and rest 1.47 million cells with missing values.
+
+### Get some idea about the average ratings of the movies
+
+Figure \@ref(fig:fig-hist1) shows the distribution of the average movies ratings. Although the distribution looks mostly bell-shaped, there are spikes at the extremes. This could be because these movies did not have enough ratings.
+
+```{r fig-hist1, fig.cap=""Average Movie Ratings ,warning=FALSE, message=FALSE}
+
+colMeans(MovieLense) %>% 
+  tibble::enframe(name = "movie", 
+                  value = "movie_rating") %>% 
+  ggplot(aes(movie_rating)) +
+  geom_histogram(color = "white") +
+  theme_minimal()
+
+```
+
+
+### Get some idea about the total number of ratings by each user
+
+
+Figure \@ref(fig:fig-hist2) shows the distribution of the user rating count. As expected, most users do not rate many movies. This is consistent with the power law in user rating counts in other domains.^[Read http://www.shirky.com/writings/powerlaw_weblog.html] 
+
+```{r fig-hist2, fig.cap="User Rating Count", warning=FALSE, message=FALSE}
+
+rowCounts(MovieLense) %>% 
+    tibble::enframe(name = "user", 
+                  value = "rating_count") %>% 
+  ggplot(aes(rating_count)) +
+  geom_histogram(color = "white") +
+  theme_minimal()
+
+```
+
+
+For the analysis it might be a good idea to remove extreme movies and users. If a movie is rated by less than 50 users then we will drop it. If a user has rated fewer than 25 movies we will drop the user. Obviously these are subjective cutoffs so you can play around with other values. We will create a smaller matrix `movie_small` with these filters.
+
+```{r}
+
+movie_small <- MovieLense[rowCounts(MovieLense) >= 25,
+                     colCounts(MovieLense) >= 50]
+movie_small
+
+```
+
+By using these cutoffs, we shrunk our data considerably. The resulting matrix is only about 31% of the original matrix.
+
+```{r}
+sum(table(as.vector(movie_small@data))) / 
+  sum(table(as.vector(MovieLense@data)))
+```
+
+## Build a recommender
+
+We build the recommender with an evaluation scheme using `evaluationScheme()` function. Here we provide all the relevant information for creating a recommender in the next step. Consider this as something similar to `trainControl()` function from `caret`. A critical difference is that in `evaluationScheme()` we also provide the data, which in our case is `movie_small`. This is because `evaluationScheme()` creates data partitions based on the method that we select.
+
+I personally prefer to use cross validation while building a machine learning model. In the code below, you can change the `method` argument to other values as given in the documentation. `k` specifies the number of cross validation folds. The next argument `given` is a critical parameter. Here we specify how many rating could be used (or withheld) from the test set while validating the model. For example, `given = 15` means that while testing the model, use only randomly picked 15 ratings from every user to predict the unknown ratings. A negative value of `given` specifies the ratings to withhold. For instance, `given = -5` will use all the rating except 5 ratings for every user to test the model. 
+
+**All else equal, a model that performs well with lower values of `given` is desirable because user ratings are sparse.**
+
+Finally, pick a threshold for `goodRating`, which will be used for recommending the movies later on. I have picked 4 in the code below, meaning any movie with a rating 4 and above should be considered as a movie with good rating.
+
+```{r}
+set.seed(12345)
+eval_movies <- evaluationScheme(data = movie_small, 
+                      method = "cross-validation", 
+                      k = 10,
+                      given = 15, 
+                      goodRating = 4)
+eval_movies
+
+```
+
+`evaluationScheme()` creates 3 data sets. It splits the data into train and test set but then within the test set it further creates a `known` and an `unknown` data sets. The `known` test data has the ratings specified by `given` and unknown has the remaining ratings, which will be used to validate the predictions made using `known`.
+
+For ease of exposition below, we save these data sets separately.
+
+```{r}
+train_movies <- getData(eval_movies, "train")
+known_movies <- getData(eval_movies, "known")
+unknown_movies <- getData(eval_movies, "unknown")
+```
+
+
+## Evaluate recommender performance
+
+Now we are all set to build and test various recommenders. `recommenderlab` gives us several options. We will test all of them. These are specified using `method` argument and the possible values are: `IBCF`, `UBCF`, `POPULAR`, `RANDOM`, `SVD` and `SVDF`. `RANDOM` just presents random items to users and works as a benchmark for model comparisons.
+
+The model evaluation in this case will be done using `RMSE` and similar metrics. Lower values suggest better model performance.
+
+### IBCF
+
+```{r}
+ibcf <- 
+  train_movies %>%
+  Recommender(method = "IBCF") 
+
+ibcf_eval <- ibcf %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+
+Print the model stats.
+
+```{r}
+print(ibcf_eval)
+```
+
+
+### UBCF 
+
+```{r}
+ubcf <- 
+  train_movies %>%
+  Recommender(method = "UBCF")
+
+ubcf_eval <- ubcf %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+Print the model stats.
+
+```{r}
+print(ubcf_eval)
+```
+
+### Popular
+
+```{r}
+pop <- 
+  train_movies %>%
+  Recommender(method = "POPULAR")
+
+pop_eval <- pop %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+
+Print the model stats.
+
+```{r}
+print(pop_eval)
+```
+### Random
+
+```{r}
+random <- 
+  train_movies %>%
+  Recommender(method = "RANDOM")
+
+random_eval <- random %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+Print the model stats.
+
+```{r}
+print(random_eval)
+```
+
+### SVD
+
+```{r}
+svd <- 
+  train_movies %>%
+  Recommender(method = "SVD")
+
+svd_eval <- svd %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+
+Print the model stats.
+
+```{r}
+print(svd_eval)
+```
+### SVDF
+
+```{marginfigure}
+This might take some time depending on your processor.
+```
+
+
+```{r eval=FALSE}
+svdf <- 
+  train_movies %>%
+  Recommender(method = "SVDF")
+
+
+svdf_eval <- svdf %>% 
+  predict(known_movies, type = "ratings") %>% 
+  calcPredictionAccuracy(unknown_movies)
+```
+
+
+Print the model stats.
+
+```{r}
+print(svdf_eval)
+```
+
+
+We can now plot the `RMSE` of all the recommenders we built.
+
+```{r fig-eval, fig.cap="Recommender Performance"}
+rbind(ibcf_eval, ubcf_eval, pop_eval, 
+      random_eval, svd_eval, svdf_eval) %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "method") %>% 
+  ggplot(aes(x = method, y = RMSE)) +
+  geom_col() +
+  theme_minimal()
+```
+
+Figure \@ref(fig:fig-eval) shows the performance of each recommender algorithm. In our case, popular method has done well. This suggests that recommending people the most popular movies is a good option in this data. This is not surprising as Netflix often shows us the "Trending" movies or TV shows.
+
+
+## Giving recommendations
+
+Finally, we will use the "popular" method to provide recommendations. We will show top 5 movies to the first 4 users.
+
+
+```{r}
+recos_pop <- pop %>% 
+  predict(known_movies, n = 5)
+```
+```{r}
+as(recos_pop, "list") %>%
+  head(4)
+```
+
+As expected, popular recommendations are the same for all the users.
+
+Let's also see the recommendations based on Funk SVD.
+
+```{r eval = FALSE}
+recos_svdf <- svdf %>% 
+  predict(known_movies, n = 5)
+
+```
+
+
+```{r}
+as(recos_svdf, "list") %>%
+  head(4)
+```
+
+Funk SVD suggests different movies to different users.
+
+
+## Summary
+
+This chapter introduces the concept of collaborative filtering, which is widely used in recommender systems. Using `MovieLense` data set from `recommenderlab` package, we build a movie recommender. We compare multiple methods and find that recommendations based on popular movies and Funk SVD have the least RMSE.
