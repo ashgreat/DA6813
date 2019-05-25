@@ -1,0 +1,475 @@
+---
+title: "Clustering Techniques"
+author: "Pallav Routh"
+date: "5/12/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+**Copy and paste this code in your concole and run it**
+
+install.packages(c("factoextra", "plotly", "SMCRM"))
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(knitr)
+library(tibble)
+library(dplyr)
+library(factoextra)
+library(plotly)
+library(SMCRM)
+library(caret)
+```
+
+# Cluster Analysis
+
+```{marginfigure}
+Most of the code in this book chapter is thanks to Pallav Routh who is a
+PhD student in my department. 
+```
+
+
+Imagine that a marketer wants to group customers into identifiable groups. The marketer has customer demographic as asll as purchase behavior data on these customers. The objective then is to create groups such that the customers within each group are homogenous and customers in any two groups are heterogenous. As these groups are not yet formed, there is no "target" variable that the marketer can use to build a predictive model. All the marketer has is the data on customer characteristics and purchase behavior. In machine learning, a modeling problem without a labelled target variable is called unsupervised learning problem. In this specific case of customer segmentation, cluster analysis turns out to be a highly popular unsupervised learning method.
+
+Cluster analysis or clustering is a task that can be completed using many different algorithms. In this exercise, we will use *k-means* clustering, which identifies *k* number of clusters (or groups) that gives us the low variability within a cluster and high variability between two clusters.
+
+## Tasks to complete
+
+
+1. Using customer purchase behavior data perform cluster analysis to determine the optimum number of customer segments.
+
+2. Visualize customer segments.
+
+2. Describe the customer segments to help marketers target customers.
+
+## Data description
+
+We will use two **simulated** data sets from `SMCRM` package. This package consists of 7 data sets used in the book titled "Statistical Methods in Customer Relationship Management" by [Kumar and Petersen].(https://www.wiley.com/en-us/Statistical+Methods+in+Customer+Relationship+Management-p-9781119993209) Specifically we will use `customerRetentionTransactions` and `customerRetentionDemographics` data sets. The first data consists of customer transactions information on 500 customers over 12 quarters. There are no missing values so every customer has 12 observations and accordigly there are 6,000 observations (500*12). The second data set contains demographic information on 500 customers. This information is time-invariant.
+
+The data sets and their descriptions are as follows:
+
+### `customerRetentionTransactions`
+
+```{r echo=FALSE}
+
+data("customerRetentionDemographics")
+data("customerRetentionTransactions")
+
+tibble(Variable = names(customerRetentionTransactions),
+       Description = c("customer number (from 1 to 500)",
+                      "quarter (from 1 to 12) where the transactions occurred",
+                      "1 when the customer purchased in the given quarter and 0 if no purchase occurred in that quarter",
+                      "dollar value of the purchases in the given quarter",
+                      "number of different categories purchased in a given quarter",
+                      "dollars spent on marketing efforts to try and retain that customer in the given quarter",
+                      "square of dollars spent on marketing efforts to try and retain that customer in the given quarter")) %>% 
+  kable(caption = "Variable Description for `customerRetentionTransactions`",
+        booktabs = TRUE)
+
+```
+
+
+### `customerRetentionDemographics`
+
+```{r echo=FALSE}
+
+tibble(Variable = c("customer", "gender", "married", "income", "first\\_purchase", "loyalty", "sow","clv" ),
+       Description = c("customer number (from 1 to 500)",
+                       "1 if the customer is male, 0 if the customer is female",
+                       "1 if the customer is married, 0 if the customer is not married",
+                       "1 if income <= $30,000; 
+                       2 if $30,000 < income <= $45,000; 
+                       3 if $45,000 < income <= $60,000; 
+                       4 if $60,000 < income <= $75,000; 
+                       5 if $75,000 < income <= $90,000;  
+                       6 if income > $90,000",
+                       "value of the first purchase made by the customer in quarter 1",
+                       "1 if the customer is a member of the loyalty program, 0 if not",
+                       "share-of-wallet; the percentage of purchases the customer makes from the given firm given the total amount of purchases across all firms in that category",
+                       "discounted value of all expected future profits, or customer lifetime value")
+       
+       )
+  
+```
+
+
+## Clustering variables
+
+
+In marketing, three variables from customer purchase history are known to play a bit role in predicting future purchases. These variables are recency, frequency, and monetary value. In our context, these are measured as:
+
+1. Recency: The number of quarters since the last purchase
+
+2. Frequency: The number of times transacted over 12 quarters. As the exact number of transactions is unavailable, we assume that customer has transacted once in a quarter, if the total expenditure is non-zero.
+
+3. Monetary value: The total dollar value of transaction in 12 quarters.
+
+Accordingly, we create a new data set with these variables. The last two variables are straightforward to calculate so we will first generate a data set with these variables.
+
+```{r}
+
+cluster_data1 <-
+  customerRetentionTransactions %>%
+    group_by(customer) %>%
+     summarize(frequency = sum(purchase),
+               monetary_value = sum(order_quantity)) %>%
+    ungroup()
+
+```
+
+Next, we create a column for recency and save it in another data frame.
+
+```{r}
+
+cluster_data2 <-
+  customerRetentionTransactions %>%
+               filter(purchase == 1) %>%
+               group_by(customer) %>%
+                  summarise(last_transaction = last(quarter)) %>%
+                  mutate(recency = 12 - last_transaction) %>%
+               ungroup() %>%
+               select(-last_transaction)
+
+```
+
+Finally, we will merge these two data sets. We will also merge the demographics data. 
+
+```{r}
+cluster_data <- inner_join(cluster_data1,
+                           cluster_data2,
+                           by = "customer") %>% 
+  inner_join(customerRetentionDemographics,
+             by = "customer")
+```
+
+
+## Scaling variables
+
+Cluster analysis can use any numeric variable for clustering. The algorithms rely on a distance metric and therefore it is preferable to scale all the variables to map on to the same scale. The easiest scaling is converting data into z scores which involves mean centering a variable and then scaling that variable by the standard deviation. The `scale()` function from base R performs centering and scaling in one step.
+
+```{r}
+
+cluster_data_pro <- cluster_data %>%
+  select(recency, frequency, monetary_value) %>%
+  scale() %>% 
+  as.data.frame()
+
+```
+
+Verify that we have 0 means and 1 standard deviations
+
+```{r}
+print("Means")
+sapply(cluster_data_pro, mean) %>%  round(4)
+print("Standard Deviations")
+sapply(cluster_data_pro, sd)
+```
+
+
+## K-means clustering
+
+K-means clustering is a hungry algorithm. It will randomly pick up some points at the beginning as the cluster centroids and then keep updating clusters depending on the distance metric.
+
+
+## Cluster feasibility
+
+Before applying the clustering algorithm, it is best to assess if the data will yield any meaningful clusters. One popular method is Hopkin's statistic that tests whether data has uniform distribution. Clustering is only possible when the distribution shows heterogenous regions. Hopkin's statistic ranges bewteen 0 and 1. Depending on the way the formula is implemented in the package, clusterability of the data is determined by how close Hopkin's statistic is to 0 or 1. We will use `get_clust_tendency()` from `factoextra` package. According to this function the closer Hopkin's statistic is to 0, the better is the clusterability in the data.
+
+This function also output a plot showing the clusters. The plot looks at the dissimilarity matrix by computing the distance between points. We ideally want to see blocks of similar color.
+
+
+```{r}
+
+set.seed(4569)
+
+clust_td <- 
+  get_clust_tendency(
+    cluster_data_pro,
+    n = 400, # Pick 400 points randomly
+    gradient = list(low = "steelblue",  
+                    high = "white")
+    )
+```
+
+Print Hopkin's statistic
+
+```{r}
+cluster_td$hopkins_stat
+
+```
+
+Hopkin's stat is close to zero, which suggests that data is clusterable. Let's take a look at Figure \@ref(fig:fig-clust1), which also supports that there are blocks of data that can be clustered.
+ 
+```{r fig-clust1, fig.cap="Cluster Feasibility Plot"}
+cluster_td$plot
+```
+ 
+
+## Optimal number of clusters
+
+Ideally the cluster analysis should result in clusters with low within cluster variance and high between cluster variance. The first "elbow" on the plot gives us the optimal number of clusters. We will use `fviz_nbclust()` function from `factoextra` package. In argument `wss` stands for "within sum of sqaures". As we increase the number of clusters, `wss` should go down. Usually in the plot we see a kink or elbow after which `wss` flattens out. This is a somewhat subjective process.
+
+```{r fig-clust2}
+fviz_nbclust(cluster_data_pro, kmeans, method = "wss")
+```
+
+
+In Figure \@ref(fig:fig-clust2), the kink occurs when the number of cluster is at 4 or 5 depending how sensitive you are to the decrease in `wss` visually. For this example, we will consider 4 clusters as optimum.
+
+## k-means to create clusters
+
+Now we are ready to perform clustering. As we are using k-means clustering, we will use `kmeans()` function from base R's `stats` package. Recall that k-means is a hungry algorithm and it starts making clusters randomly. In order to avoid a situation where we start off on suboptimal points, `kmeans()` allows us to specify a number of starting points to try. The `nstart` argument in the function specifies this number.
+
+```{r}
+
+set.seed(309)
+
+km_cluster <- kmeans(cluster_data_pro, 
+                     4, 
+                     nstart = 25)
+
+```
+
+`km_cluster` is a list of 9 items. we are interested in the cluster membership of each point, which is stored in `km_cluster$cluster`. Add these clusters to the data.
+
+```{r}
+cluster_data$km_cluster <- km_cluster$cluster
+```
+
+
+## Visualize clusters
+
+The `fviz_cluster()` function visualizes the cluster in 2 dimensions. However, we have 3 dimensions. `fviz_cluster()` performs Principle Components Analysis (PCA)^[PCA is a dimensionality reduction technique.] behind the scenes to reduce the dimensions such that data can be represented by clusters in a 2-D space.
+
+```{r fig-clust3, fig.cap="Cluster Plot"}
+fviz_cluster(object = km_cluster, # kmeans object 
+             data = cluster_data_pro, # data used for clustering
+             ellipse.type = "norm",
+             geom = "point",
+             palette = "jco",
+             main = "",
+             ggtheme = theme_minimal())
+```
+
+
+Figure \@ref(fig:fig-clust3) shows that we have really neat clusters with not a lot of overlap.
+
+Although not possible in all the cases, for out exercise, we can also build a 3-D plot because we have only 3 clustering variables. We will use `plotly` package for making an interactive visualization. The code below, without explanation, shows you how to make an interactive 3-D plot. Interactivity will not work in PDF.
+
+
+```{r }
+plot_ly(x = cluster_data$recency, 
+        y = cluster_data$frequency, 
+        z = cluster_data$monetary_value, 
+        type = "scatter3d", 
+        mode = "markers", 
+        color = as.factor(cluster_data$km_cluster)) %>%
+        layout(title = "Layout options in a 3d scatter plot",
+               scene = list(xaxis = list(title = "Recency"),
+                            yaxis = list(title = "Frequency"),
+                            zaxis = list(title = "Monetary value")))
+```
+
+## Cluster characteristics
+
+Once we form the clusters, our next task is to find the characteristics of the customers in those clusters. First, we will see the average values pertaining to recency, frequency, and monetary value.
+
+
+```{r eval=FALSE}
+cluster_data %>%
+  group_by(km_cluster) %>%
+  summarise(mean_recency = mean(recency),
+            mean_frequency = mean(frequency),
+            mean_mv = mean(monetary_value),
+            members = n()) %>% 
+  mutate_all(round, 3)
+```
+
+
+Table \@ref(tab:tab-clust1) shows that customers in cluster 1 spent \$3,368 in the last 12 quarters and have low recency and high frequency.^[Low recency means that these customers made purchases very recently.] Cluster 2 customers seem to be the worst lot because they spent only \$513 in the last 12 quarters with high recency and low frequency. It's possible that the customers in the segment are no longer planning to return and buy anything. Thus, the firm may have lost them.
+
+```{marginfigure}
+
+An important exercise at this point is to name these customer segments. 
+For example, cluster 2 can be named "Lost Cause" because they are probably 
+not returning. Can you think of names for other customer segments?
+```
+
+
+## Explore the segments
+
+Now that we have isolated 4 customer segments from our existing customers, we shift our attention to a practical problem. If marketers want to use this information to target *new* customers, they will need description of the customers that they can use to locate these customers. By definition, a new customer has not purchased from you before. Therefore, you don't have their purchase behavior data. However, if we can correlate customer demographics with the customer segments, then we can help marketers in identifying these segments.
+
+Let's investigate 3 demographic variables &mdash;gender, marital status, and income&mdash; within each cluster.
+
+### Gender
+
+```{r}
+cluster_data %>%
+  mutate(Gender = ifelse(gender == 1, "Male", "Female")) %>%
+  group_by(km_cluster, Gender) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = km_cluster, y = count, fill = Gender)) +
+   geom_col(position = "dodge", color = "white") +
+   scale_fill_brewer(palette = "Set1") +
+   labs(y = "Count", x = "Clusters") +
+   theme_minimal() +
+   theme(legend.position = "top")
+```
+
+Cluster 1, 3, and 4 have even distributions of males and females. Cluster 2 has a slightly higher concentration of females. However, targeting based on gender alone may not give significant sales.
+
+### Marital status
+
+```{r}
+
+cluster_data %>%
+  mutate(Married = ifelse(married == 1, 
+                          "Married", 
+                          "Unmarried")) %>%
+  group_by(km_cluster, Married) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = km_cluster, y = count, fill = Married)) +
+   geom_col(position = "dodge", color = "white") +
+   scale_fill_brewer(palette = "Set2") +
+   labs(y = "Count", x = "Clusters") +
+   theme_minimal() +
+   theme(legend.position = "top")
+```
+
+In general, all clusters have higher concentration of unmarried customers compared to married. Thus, marital status is not a good disciminant variable.
+
+### Income
+
+```{r}
+cluster_data %>%
+  mutate(Income = plyr::mapvalues(
+    income,
+    from = c(1:6),
+    to = c("< $30k", "$30k-$45k","$45k-$60k","$60k-$75k",
+           "75k-$90k",">$90k"))) %>% 
+  group_by(km_cluster, Income) %>%
+   mutate(count = n()) %>%
+   ggplot(aes(x = km_cluster, 
+              y = count, 
+              fill = reorder(Income, income))) +
+   geom_col(position = "dodge", color = "#4c566a") +
+   scale_fill_brewer("Income group") +
+   labs(y = "Count", x = "Clusters") +
+   theme_minimal() +
+   theme(legend.position = "top")
+```
+
+Clearly, `income` varies a lot between these 4 segments. 
+
+## Random forest for segment description
+
+Finally, we will use random forest for creating segment definitions. If you want to read more on building a predictive model using random forest, please see Section \@ref(ins-model).
+
+
+### Prepare the data
+
+We will make minor changes to the data set. First, we will drop irrelevant variables. Next we will recode `gender`, `married`, `income`, and `km_cluster` so that their levels are character variables rather than numers. We then reclassify these 4 variables as factors. This is essential because R will internally create dummy variables for factors. The factor levels will be used to create internal variable names, which will work only for character values of the levels.
+
+```{r}
+cluster_dt_rf <- cluster_data %>% 
+  select(-c(customer, frequency, monetary_value, recency)) %>% 
+  mutate(gender = plyr::mapvalues(
+                  gender,
+                  from = c(0, 1),
+                  to = c("f", "m")),
+         married = plyr::mapvalues(married,
+                   from = c(0,1 ),
+                   to = c("no", "yes")),
+         income = plyr::mapvalues(income,
+                  from = c(1:6),
+                  to = c("i1", "i2", "i3", 
+                         "i4", "i5", "i6")),
+         km_cluster = plyr::mapvalues(km_cluster,
+                      from = c(1:4),
+                      to = c("c1", "c2", "c3", "c4"))) %>% 
+  mutate_at(vars(gender, married, income, km_cluster), as.factor)
+```
+
+
+### Create train and test data sets
+
+```{r}
+index <- createDataPartition(cluster_dt_rf$km_cluster, 
+                             p = 0.8,
+                             list = FALSE)
+```
+
+```{r}
+train_dt <- cluster_dt_rf[index, ]
+test_dt <- cluster_dt_rf[-index, ]
+```
+
+
+### Set up train control
+
+We are using 10-fold cross-validation.
+
+```{r eval=FALSE}
+
+trControl <- trainControl(method = "cv", #crossvalidation
+                          number = 10,   # 10 folds
+                          search = "grid",
+                          classProbs = TRUE  #computes class probabilities
+                          ) 
+
+tuneGrid_large <- expand.grid(mtry = c(1:(ncol(train_dt) - 2)))
+
+```
+
+
+### Train the model. This will take a few minutes.
+
+```{r eval = FALSE}
+
+set.seed(2222)
+
+modelRF_large <- train(km_cluster ~ . , 
+                 data = train_dt, 
+                 method = "rf", 
+                 metric = "Accuracy",
+                 tuneGrid = tuneGrid_large,
+                 trControl = trControl,
+                 ntree = 1000)
+```
+
+
+Check which `mtry` gives us the best result.
+
+```{r}
+print(modelRF_large)
+```
+
+Turns out that the model with `mtry = 2` is the best.
+
+### Get the variable importance
+
+```{r}
+varImp(modelRF_large, scale = TRUE)
+```
+
+`clv` and `sow` are the most important predictors. The cluster analysis effectively clustered people based on their customer lifetime value and share of wallet!^[If this is going to be used to identify new customers, where do we get data on CLV and SOW?]
+
+## Model performance
+
+Finally, let's assess the model performance by using it on the test data set. 
+
+```{r}
+confusionMatrix(predict(modelRF_large, 
+                        select(test_dt, -km_cluster)), 
+                reference = test_dt$km_cluster, 
+                positive = "Yes")
+```
+
+The model does a fairly good job of predicting the customer segments out of sample. We get almost 78% accuracy and Kappa equaling 0.68. The model overclassified customers in segment 2. All the misclassifications are predominantly because of classifying segment 3 customers as segment 3. Perhaps these two segments are quite close to each other on the predictor variables. On the other hand segment 1 and 4 classifications are quite accurate.
+
+## Summary
+
+In this exercise, we segmented customers in 4 groups based on their past purchase behavior. We used recency, frequency, and monetary value (RFM) to segment customers. K-means clustering led to 4 segments. Next we described the segments using customer demographics. Using random forest classifier, we found out that customer lifetime value and share of wallet are two critical metrics for segmenting customers.
+
