@@ -11,7 +11,8 @@ mex_loc <- c(mexico_city = "19.43,-99.13,50mi",
 
 # I have added the 5 largest metropolitan areas in Mexico above. You can add more.
 
-myquery <- "#FelizLunes"
+myquery <- "#FelizLunes" # Add your query here.
+
 mytweets <- list()
 
 for (i in 1:length(mex_loc)) {
