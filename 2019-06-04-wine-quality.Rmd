@@ -1,0 +1,714 @@
+---
+title: "Wine Quality"
+author: "Ashwin Malshe"
+date: "6/4/2019"
+output: html_document
+---
+# Predicting Wine Quality
+
+This chapter shows you how to deal with dependent variables that are categorical in nature and have more than two levels. Because the variable is not binary, the modeling becomes more complex. In this chapter you will learn how to use:
+
+1. Multinomial logistic regression,
+
+2. Support Vector Machines, and
+
+3. Ordinal Regression
+
+
+## Task Description
+
+For this task, we will use wine quality data set available here: https://archive.ics.uci.edu/ml/datasets/Wine+Quality. There are separate CSV files for white and red wine. Combine them and make a larger united file.
+
+### Data Set Information
+
+**This part is verbatim reproduced from UCI.**
+
+*The two data sets are related to red and white variants of the Portuguese "Vinho Verde" wine. For more details, consult the paper by Cortez et al., 2009. Due to privacy and logistic issues, only physicochemical (inputs) and sensory (the output) variables are available (e.g. there is no data about grape types, wine brand, wine selling price, etc.).*
+
+*These datasets can be viewed as classification or regression tasks. The classes are ordered and not balanced (e.g. there are much more normal wines than excellent or poor ones). Outlier detection algorithms could be used to detect the few excellent or poor wines. Also, we are not sure if all input variables are relevant. So it could be interesting to test feature selection methods.* ^[We are not doing feature selection in this exercise.]
+
+
+*Attribute Information:*
+*For more information, read [Cortez et al., 2009].*
+*Input variables (based on physicochemical tests):*
+
+1. fixed acidity
+
+2. volatile acidity
+
+3. citric acid
+
+4. residual sugar
+
+5. chlorides
+
+6. free sulfur dioxide
+
+7. total sulfur dioxide
+
+8. density
+
+9. pH
+
+10. sulphates
+
+11. alcohol
+
+*Output variable (based on sensory data):*
+
+12. quality (score between 0 and 10)
+
+## Specific Tasks to Complete
+
+1. Build a logistic regression model using **`quality`** as the target variable. Note that you don’t have binary classification task any more. For this you will have to use multinomial logistic regression. However, you can still interpret the model output (i.e., statistical significance of the coefficients, etc. exactly the same way as binary logistic regression).
+
+2. Use support vector machine (SVM) to estimate the model. Treat quality as a multiple categorical variable.
+
+3. Treat quality as a continuous variable. Estimate a linear regression model and compare the output with multinomial regression and SVM.
+
+4. Estimate the model using quality as an ordinal variable.
+
+
+## Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(kableExtra)
+library(here)
+```
+
+Load all the relevant packages. If you do not have any of these packages installed, use `install.package()` function to install it from CRAN.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(caret)
+library(dplyr)
+library(moments)
+library(ggplot2)
+library(ggcorrplot)
+library(e1071)
+library(doParallel)
+library(nnet)
+library(reshape2)
+library(ordinal)
+```
+
+### Read wine data
+
+For this solution, I am going to read the data sets that I have already downloaded and saved on Github. you don't have to use these but if you want to, the data sets are available from my public [Github repository](https://github.com/ashgreat/datasets)
+
+We can directly read the CSV files using `read.csv()` function from Base R. I have cleaned up the data a little bit. There are separate CSV files for red and white wine. First, we will read the two data files and add a column to indicate which type of wine it is. Finally, we will stack the two data sets on top of each other using `rbind()` function from Base R.
+
+```{r read-data,linewidth=40}
+
+red <- read.csv("http://bit.ly/2LvaPv7",
+                stringsAsFactors = FALSE) %>% 
+  mutate(wine = "red")
+
+white <- read.csv("http://bit.ly/2VlYfCJ",
+                  stringsAsFactors = FALSE) %>%
+  mutate(wine = "white")
+
+wine <- rbind(red, white) %>% 
+   mutate(wine = as.factor(wine))
+
+```
+
+Note that I changed the variable `class` of `wine` to **`factor`**. This is because it will be easier for us to use this variable directly in the models as R will internally create a indicator variable such that red wine will equal 0 and white wine will equal 1. We will later create a variable that deals with explicitly.
+
+## Summarize data
+
+Start with basic summary using base R.
+
+```{r}
+summary(wine)
+```
+
+A few of these variables have very tight distributions (e.g., `density`). Also, extreme values might cause a problem in some other cases (e.g., `residual_sugar`). We will have to correct these later on. 
+
+Our dependent variable is `quality`. As we will be using it as a categorical variable in 3 of the 4 models, let's look at its frequency distribution, which we did not get from `summary()` function because `quality` is not categorical.
+
+
+```{r}
+table(wine$quality)
+```
+
+Clearly, the categories at the extremes have very few observations. This will lead to problems in correctly categorizing extreme values. In order to overcome this problem, we will create two new variables.
+
+## Create new variants of `quality`
+
+For support vector machines (SVM) and multinomial logistic model (MNL), we will create a new variable labeled `quality.c` which will be a factor variable with groups 3, 4, 8, and 9 combined in another group. We can label this combined group anything we want as the labeling is meaningless for these methods. I will label this new group `3489`, thereby preserving the knowledge that this group came from 4 separate groups. For many operations, `caret` package requires that factor levels should be valid variable names. Therefore, we will add a prefix `q_` before the numbers in `quality` to create `quality.c`.
+
+
+For ordinal regression, we have a little bit more information about the ordering of the groups. We will create a new variable `quality.o`. In this variable, we will combine 3, 4, and 5 and label it 5 to indicate this as "5 and lower". Similarly, we will combine 7, 8, and 9 and label it 7 to indicate that this group is "7 and above". Thus, we will effectively have only 3 groups.
+
+Clearly, this will make model comparison a little bit tough but we have to give each model the best chance to perform even at this lower level of analysis.
+
+
+
+```{r}
+wine <- wine %>%
+  mutate(quality.c = ifelse(quality %in% c(5, 6, 7), 
+                            paste0("q_", quality), 
+                            "q_3489"),
+         quality.o = ifelse(quality <= 5, 
+                            5,
+                            ifelse(quality >= 7, 7, 6))) %>% 
+  mutate(quality.c = factor(quality.c, 
+                            levels = c("q_5", "q_6", 
+                                       "q_7", "q_3489"))) %>%
+  mutate(quality.o = ordered(quality.o))
+
+```
+
+Check the structure of new variables.
+
+```{r}
+str(wine$quality.c)
+```
+
+```{r}
+str(wine$quality.o)
+```
+
+## Predictor variables
+
+Now that we have new dependent variables, let's take a look at the predictor variables. As we are doing a predictive analysis (we have no plan to do a statistical inference), let's understand the distribution and correlations of the variables and explore the need for transformation.
+
+For this we will first get the descriptive statistics and correlations for all the numeric variables. Table \@ref(tab:cor-table) shows the correlations.
+
+
+```{r eval=FALSE}
+
+cormat <- round(cor(as.matrix(wine[,-c(13,14,15)])),2)
+cormat[upper.tri(cormat)] <- ""
+cormat <- as.data.frame(cormat) %>% select(-quality)
+colnames(cormat) <- c("V1", "V2", "V3", "V4", "V5",
+                      "V6", "V7", "V8", "V9", "V10", "V11")
+rownames(cormat) <- paste(c(colnames(cormat), "V12"),
+                          ":",
+                          rownames(cormat))
+print(cormat)
+
+```
+
+
+
+Next we will use `ggcorrplot` package to create a nice looking correlation plot. This package is available on [CRAN](https://cran.r-project.org/web/packages/ggcorrplot/index.html) 
+
+
+
+```{r fig.margin = TRUE, fig.cap= "Correlation Heatmap"}
+
+ggcorrplot::ggcorrplot(round(cor(as.matrix(wine[, -c(13,14,15)])), 2), 
+            p.mat = ggcorrplot::cor_pmat(as.matrix(wine[, -c(13,14,15)])),
+            hc.order = TRUE, type = "lower",
+            outline.col = "white",
+            ggtheme = ggplot2::theme_minimal,
+            colors = c("#cf222c", "white", "#3a2d7f")
+            )
+
+```
+
+
+In the above heat map, the crosses indicate non-significant correlations. From the correlations, most variables have their own unique information set. However, it appears that `quality` is strongly related to only a few variables. This is not great news!^[At this point one can think of transformations to increase the correlations between the variables. However, I am not going to do it as this will make this exercise broader than I want. This is left to the reader as an exercise.]
+
+## More descriptive statistics
+
+Let's get more descriptive statistics in order to understand the distribution of our variables a little better.
+
+```{r rows.print = 12}
+
+wine_temp <- wine[,-c(13,14,15)]
+
+desc <- as.data.frame(cbind(Mean = sapply(wine_temp, mean),
+                      Median = sapply(wine_temp, median),
+                      Std_Dev = sapply(wine_temp, sd),
+                      CV = sapply(wine_temp, sd) / sapply(wine_temp, mean),
+                      Skewness = sapply(wine_temp, skewness),
+                      Kurtosis = sapply(wine_temp, kurtosis)))
+```
+
+```{r eval=FALSE}
+round(desc,2)
+
+```
+
+
+The most interesting column for me is the CV (coefficient of variation). This is the ratio of standard deviation to the mean. We have certain observations where CV is very low (e.g., 0 or 0.05). This means that the standard deviation is extremely small compared to the mean. Clearly we need some scaling here to remove the effect of the mean. One way to do that is to mean center all the variables so that we have zero mean all across. It retains the low standard deviation, however. To overcome this issue, we can divide all the variables by their standard deviations. This way, we will normalize our data such that all the variables will have mean = 0 and standard deviation = 1.^[Will that help with reducing skewness and kurtosis? Think about it for a moment before you read on.] 
+
+Let's scale the numeric variables.
+
+```{r rows.print = 12}
+
+# First create a duplicate dataset
+wine2 <- wine
+wine2[,c(1:12)] <- scale(wine[ , c(1:12)])
+
+desc2 <- as.data.frame(cbind(Mean = sapply(wine2[ , c(1:12)], mean),
+                      Median = sapply(wine2[ , c(1:12)], median),
+                      Std.Dev = sapply(wine2[ , c(1:12)], sd),
+                      Skewness = sapply(wine2[ , c(1:12)], skewness),
+                      Kurtosis = sapply(wine2[ , c(1:12)], kurtosis)))
+
+```
+
+
+```{r eval=FALSE}
+round(desc2,2)
+```
+
+
+Scaling doesn't affect skewness or kurtosis. In order to alter these two moments, we need to use nonlinear transformation such as logarithmic or square root transformations. I'm going to do it through trial and error.
+
+Normal distribution has skewness = 0 and kurtosis = 3. `total_sulfur_dioxide`, `pH`, `alcohol`, and `quality` seem to have this shape (a good idea is to plot these distributions). I am concerned about `fixed_acidity`, `chlorides`, `free_sulfur_dioxide`, `density`, and `sulphates` due to high kurtosis (and skewness in some cases). Let's take their log transform first and then scale these variables.
+
+```{r}
+wine2[ , c(1, 5, 6, 8, 10)] <- scale(log(wine[ , c(1, 5, 6, 8, 10)]))
+```
+
+Print skewness and kurtosis.
+
+```{r eval=FALSE}
+moments::skewness(wine2[,c(1, 5, 6, 8, 10)])
+
+```
+
+
+```{r echo=FALSE}
+knitr::kable(moments::skewness(wine2[,c(1, 5, 6, 8, 10)]),
+             col.names = NULL,
+             caption = "Skewness",
+             booktabs = TRUE) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F,
+                position = "center")
+```
+
+
+```{r eval=FALSE}
+moments::kurtosis(wine2[,c(1, 5, 6, 8, 10)])
+
+```
+
+
+Except for `density` the remaining 4 variables benefited from log transformation. After plotting the distribution for `density` it appears that this might be because of a couple of extreme values. Although log transformation should have gotten rid of them, it seems it didn't work out. So I replaced the two extreme values (there were 3 observations) with the next highest observation and then took log. As it turns out, the transformation paid off.
+
+
+```{r}
+
+# replace the values > 1.00369 by 1.00369
+
+wine2$density <- ifelse(wine$density > 1.00369, 
+                        1.00369, 
+                        wine$density)
+wine2$density <- scale(log(wine2$density))
+
+moments::skewness(wine2$density)
+moments::kurtosis(wine2$density)
+```
+
+Now we have a data set `wine2` which has all the transformed variables. We will use it for the rest of the analysis.
+
+  
+## Linear regression model
+
+For linear regression model, our assumption is that `quality` is a continuous variable. It's certainly a debatable assumption. However, in many practical cases, a linear regression model works out pretty OK so I am starting off with it.
+
+```{r}
+model.lm <- caret::train(quality ~ ., 
+                         data = wine2[, -c(14,15)], 
+                         method = "lm")
+summary(model.lm)
+```
+
+We get a decent model with adjusted-R^2^ = 0.3065. The model is highly significant with p-value of F-statistic < 2.2E-16. Except for `citric_acid` all the other variables are statistically significant at conventional levels.
+
+Note that I also included the variable `wine` in the data set while estimating the model. As it turns out, white wines have on average lower rating than red wines (all else equal).^[I would have liked to tweak this model a little bit to understand if there are any interactions present. I will leave it for the readers as an exercise.]
+
+## Multinomial logistic regression (MNL)
+
+For MNL, we will use `quality.c` as the dependent variable. Recall that this is a categorical variable with groups 3, 4, 8, and 9 bundled together.^[Before we even run any model, I can tell you that this bundling is going to cause some problems. This is because we have assumed no ordering in `quality`. But in reality there is an ordering: 9 > 8 > 7 > ...> 3. We will repeat this analysis with `quality.o` later with ordinal logit.]
+
+```{r}
+table(wine2$quality.c)
+```
+
+We will use `caret` to estimate MNL using its `multinom` method. Note that `caret` uses `nnet` ( [CRAN](https://cran.r-project.org/web/packages/nnet/index.html)) under the hood for estimating MNL.
+
+MNL does not require a tuning parameter. However, if we want to try out a penalized (regularized) MNL, the tuning parameter is `decay` ($decay\in[0, 1]$).^[In the documentation for `nnet` I could not find out whether the regularization is LASSO or Ridge.]
+
+We will start with defining the train control and creating a parameter grid.
+
+```{r}
+
+trControl_mnl <- trainControl(method = "cv",
+                              number = 10,
+                              search = "grid",
+                              classProbs = TRUE,
+                              summaryFunction = multiClassSummary)
+
+tuneGrid_mnl <- expand.grid(decay = seq(0, 1, by = 0.1))
+```
+
+Note that we are using `multiClassSummary()` for `summaryFunction` argument. This will return very detailed summary for all the classes, which can be useful when we use `confusionMatrix()` function.
+
+Before we estimate MNL, we need to create a train and test set. The next code chunk creates a 80% training set and 20% test set.
+
+```{r}
+set.seed(2091)
+index <- caret::createDataPartition(wine2$quality.c,
+                                    p = 0.8,
+                                    list = FALSE)
+
+train_wine <- wine2[index, ]
+test_wine <- wine2[-index, ]
+```
+
+
+Now we are ready to estimate MNL. MNL is a parametric model that is commonly estimated using maximum likelihood estimation. As the likelihood function does not have a closed form, likelihood is maximized using an iterative process. We can provide maximum iterations to use for estimating the model, which we set at 100.  Usually `multinom` displays the outcome of every 10th iterations. In our case, we specified 10-fold CV and 11 potential values for `decay`. This means that we will have 110 outputs showing results of 10 iteration blocks! We probably do not need so much output so we can turn it off by specifying `trace = FALSE`.
+
+**The following code may take some time to run. On my Mac it took about 28 seconds.**
+
+```{r eval=FALSE}
+model_mnl <- caret::train(quality.c ~ ., 
+                          data = train_wine[ , -c(12,15)],
+                          method = "multinom",
+                          maxit = 100,
+                          trace = FALSE, # suppress iterations
+                          tuneGrid = tuneGrid_mnl,
+                          trControl = trControl_mnl
+                          )
+```
+
+
+You might get a warning that there were missing values in resampled performance measures. Unless you really care about all the performance metrics that `caret` reports, this is not a major concern.
+
+Let's take a look at the best value for `decay`. For this model it is 0.2.
+
+```{r}
+model_mnl$bestTune
+```
+
+If you want to take a look at the full summary for each value of `decay`, we can print `model_mnl$results` data frame. Below, I print only AUC and Accuracy. It seems that the accuracy is not sensitive to the decay.
+
+```{r}
+model_mnl$results %>% 
+   select(decay, AUC, Accuracy)
+```
+
+### Model parameters
+
+We have to calculate z-statistics and p-values manually as `multinom` does not report them. We first create an object that holds the summary of `model_mnl`. Next, we calculate z-statistics by dividing model coefficients by standard errors. Finally, we calculate p-values for 2-tailed test of significance of model parameters.
+
+
+```{r}
+sum.mnl.c <- summary(model_mnl)
+z <- sum.mnl.c$coefficients / sum.mnl.c$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+```
+
+To make the coefficients easy to read, let's create 3 data frames that will hold all the coefficients, standard errors, z statistics, and p values. Note that MNL uses one of the categories as reference levels. If we do not explicitly specify it, it will consider the first category, in our case `quality = 5`, as the reference category. So all the results must be interpreted with respect to the reference level.
+
+```{r}
+# Coefficients for quality = 6
+
+coeff.mnl.c1 <- rbind(sum.mnl.c$coefficients[1,],
+                      sum.mnl.c$standard.errors[1,],
+                      z[1,],
+                      p[1,])
+
+rownames(coeff.mnl.c1) <- c("Coefficient", "Std. Errors", 
+                            "z stat", "p value")
+
+# Coefficients for quality = 7
+
+coeff.mnl.c2 <- rbind(sum.mnl.c$coefficients[2,],
+                      sum.mnl.c$standard.errors[2,], 
+                      z[2,], 
+                      p[2,])
+
+rownames(coeff.mnl.c2) <- c("Coefficient", "Std. Errors",
+                            "z stat", "p value")
+
+# Coefficients for quality = 3489
+
+coeff.mnl.c3 <- rbind(sum.mnl.c$coefficients[3,],
+                      sum.mnl.c$standard.errors[3,],
+                      z[3,],
+                      p[3,])
+
+rownames(coeff.mnl.c3) <- c("Coefficient", "Std. Errors", 
+                            "z stat", "p value")
+
+```
+
+
+`quality.c = 6`
+
+```{r echo = FALSE}
+knitr::kable(as.data.frame(t(round(coeff.mnl.c1, 2))),
+             align = 'c',
+             caption = "Coefficients for Wine Quality = 6",
+             booktabs = TRUE) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F,
+                position = "left")
+```
+
+
+`quality.c = 7`
+```{r echo = FALSE}
+knitr::kable(as.data.frame(t(round(coeff.mnl.c2,2))),
+             align = 'c',
+             caption = "Coefficients for Wine Quality = 7",
+             booktabs = TRUE) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F,
+                position = "left")
+```
+
+`quality.c = 3489`
+
+```{r echo = FALSE}
+knitr::kable(as.data.frame(t(round(coeff.mnl.c3,2))), 
+             align = 'c',
+             caption = "Coefficients for Wine Quality = 3489",
+             booktabs = TRUE) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F,
+                position = "left")
+```
+
+It's a good exercise to compare the coefficients of MNL and linear regressions. However, MNL has 3 equations with different variables showing up significant across the 3 models. What can you do now? One way to handle this problem is to first identify the variables that are significant across the board. We will retain them. Then look at the ones that are non-significant in all of the 3 equations. Most likely these variables can be dropped from the next iteration of MNL. The variables that are significant in a few equations are the most difficult ones. You will have to take a call depending on their overall importance. If you drop them and the performance of the model deteriorates severely, perhaps adding them back is a better choice. You can also be conservative and keep any variable that's significant at least once in the 3 models.
+
+
+### Model performance
+
+MNL model performance can be assessed on several different metrics. I will select classification accuracy as the relevant metric. As such let's get the confusion matrix by using the same samples that we used for estimating the model. You could do this using cross-validation.
+
+```{r}
+caret::confusionMatrix(predict(model_mnl, 
+                               newdata = test_wine[, -c(12, 15)], 
+                               type = "raw"),
+                       reference = test_wine$quality.c)
+```
+
+The model accuracy is 54%, which is not too bad. However, kappa is just 0.26 suggesting that the model is performing poorly on this metric.^[Usually kappa < 0.3 is considered poor.] Note that class 6 has a prevalence of around 44%. Thus, you would be right 44% of the times if you labeled all wines as 6. However, the model did a particularly poor job of detecting classes 7 and 3489. But this is the first MNL model you have estimated. You should tweak this model further to yield better results.
+
+## Support Vector Machines (SVM)
+
+The advantage of using SVM is that although it is a linear model, we can use kernels to model linearly non-separable data. We will use the default radial basis function (RBF) kernel for SVM. An SVM with RBF takes two hyper parameters that we need to tune before estimating SVM. But it takes a long time to tune. Therefore, in this example I won't actually tune it because I have already done it previously using `e1071` package.
+
+We will use `e1071` and `caret` separately to get SVM.
+
+Use the following code to estimate SVM using `e1071` package.
+
+### Hyperparameters tuning
+
+For SVM with RBF, we need to tune `gamma` and `cost` hyperparameters. Whereas `cost` is generic to SVM with any kernel function, `gamma` is specific to RBF kernel, which is given as follows:
+
+
+$$\small K(x_i, x_j) = e^{(-\gamma||x_i-x_j||^2)}$$
+
+where $\small x_i$ are the sample points and $\small x_j$ are the support vectors. $\small \gamma$ controls the extent to which support vectors exert influence on classification of any sample point.^[RBF is the Gaussian kernel and $\small \gamma = 1/\sigma^2$]
+
+Higher values of `gamma` will lead to higher in-sample error (high bias) and lower out-of-sample error (low variance).
+
+`cost` decides the penalty we want to set for not classifying sample points correctly. Therefore, lower cost will lead to more accommodating behavior leading to higher in-sample error (high bias) and lower out-of-sample error (low variance).
+
+```{r eval=FALSE}
+
+# Use multiple cores on your computer
+# Change the number of cores depending on your processer
+
+doParallel::registerDoParallel(cores = 4) 
+
+set.seed(1234)
+svm.tune <- tune.svm(quality.c ~ ., 
+                     data = wine2[, -c(12,15)],
+                     gamma = c(0.05, 0.1, 0.5, 1, 2),
+                     cost = 10^(0:3))
+```
+
+Print the best `gamma` and `cost`
+
+```{r}
+svm.tune$best.parameters
+```
+
+We find that `gamma = 1` and `cost = 1000` give us the best accuracy. You can also print the table for the performance of the entire grid by running the following code. This is not executed for this example.
+
+```{r eval=FALSE}
+svm.tune$performances
+```
+
+
+### Model estimation
+
+Using the best hyperparameters we can estimate the model. In the next code block I will use the hyperparameters from the first pass. Note that the `summary()` function for `svm()` doesn't provide any model parameters.
+
+```{r eval=FALSE}
+model.svm.c <- e1071::svm(quality.c ~ ., 
+                          data = train_wine[, -c(12, 15)],
+                          kernel = "radial",
+                          gamma = 1,
+                          cost = 1000)
+```
+
+
+Print the model summary.  Note that the `summary()` function for `svm()` doesn't provide any model parameters.
+
+```{r}
+summary(model.svm.c)
+```
+
+We have 4,389 support vectors. This suggests that the model is _memorizing_ rather than _learning_ as the training data set has only 5,200 observations. This could be because of many factors but th emost critical factor is that the predictor variables do not have much information to predict the wine quality.
+
+
+### Assessing the model performance
+
+```{r}
+caret::confusionMatrix(reference = test_wine$quality.c,
+                       predict(model.svm.c, 
+                               newdata = test_wine[, -c(12,15)], 
+                               type = "class"))
+```
+
+It looks like SVM classification on the data is far better than MNL! We get the model accuracy up to 67% from a mere 54% for MNL. Recall that the no information rate is only 44% so with SVM we could improve the accuracy by 23%.
+
+### SVM with `caret`
+
+The following code will tune the model but it's actually not going to run in this tutorial because it will take a lot of time.
+
+```{r eval=FALSE}
+
+ctrl <- caret::trainControl(method = "cv",
+                            number = 10)
+ 
+set.seed(1492)
+grid <- expand.grid(sigma = 10^(-1:4),
+                    C = 10^(0:4))
+
+model.svm.tune <- train(quality.c ~ ., 
+                        data = train_wine[ , -c(12, 15)],
+                        method = "svmRadial",
+                        tuneGrid = grid,
+                        trControl = ctrl)
+
+```
+
+
+Print the best parameter combination.
+
+```{r}
+model.svm.tune$bestTune
+```
+
+
+We will use `sigma = 1` and `cost = 100` and estimate the model. We will then use `varImp` in `caret` to get the variable importance. In order to plot variable importance, all the predictor variables have to be non-character. As we have a factor variable, `wine`, we should create a indicator dummy ourselves.
+
+```{r}
+train_wine$white_wine = ifelse(train_wine$wine == "white", 1, 0)
+test_wine$white_wine = ifelse(test_wine$wine == "white", 1, 0)
+```
+
+With the best parameters, estimate the model.
+
+```{r eval = FALSE}
+ctrl <- caret::trainControl(method = "cv",
+                            number = 10)
+
+grid <- expand.grid(sigma = 1, C = 100)
+ 
+set.seed(89753)
+
+model.svm.c1 <- train(quality.c ~ ., 
+                     data = train_wine[,-c(12, 13, 15)],
+                     method = "svmRadial", 
+                     tuneGrid = grid, 
+                     trControl = ctrl)
+```
+
+
+```{r}
+print(model.svm.c1)
+```
+
+In-sample accuracy of the model is 64%. `caret` does not report the number of support vectors. 
+
+
+### Model performance
+
+We test the SVM performance using `test_wine`
+
+```{r}
+caret::confusionMatrix(reference = test_wine$quality.c,
+                       predict(model.svm.c1, 
+                               newdata = test_wine[, -c(12, 13, 14, 15)], 
+                               type = "raw"))
+```
+
+At 66.7%, the model accuracy is comparable to the SVM estimated using `e1071`. Overall, SVM improved the model accuracy significantly over MNL.
+
+### Variable importance
+
+Next,  let's plot the variable importance using `ggplot2`.^[`caret` does not report the number of support vectors.]
+
+```{r}
+var.imp <- varImp(model.svm.c1, 
+                  scale = TRUE)
+
+var.imp2 <- var.imp$importance
+
+var.imp2$Chemistry <- rownames(var.imp2)
+
+# Transpose the data
+var.imp2 <- reshape2::melt(var.imp2, id = c("Chemistry"))
+
+ggplot(data = var.imp2, aes(x = Chemistry, y = value)) +
+   geom_col(aes(fill = variable)) +
+   facet_wrap(~variable) +
+   scale_fill_manual(values = c("#d08770", "#ebcb8b", "#a3be8c", "#b48ead")) +
+   xlab(NULL) + 
+   ylab("Importance Weight") +
+   theme_minimal() +
+   theme(axis.text.x = element_text(angle = 60, hjust = 1),
+            legend.position = "none")
+  
+```
+
+
+Similar to MNL, we have each predictor with different effectiveness in predicting different classes. Clearly `alcohol` content looks like the most important predictor for all the classes.
+
+In summary, SVM performs really well compared to MNL. Note that we have been using `quality.c` as our target variable, which assumes there is no ordering in quality. Thus, even with limited imformation, SVM performed really well.
+
+## Ordinal Regression
+
+In this last section we will use `quality.o` for estimating an ordinal model. Ordinal model can be estimated using several link functions. we will use a logit link.
+
+We will use `ordinal` package and `clm` function.
+
+```{r}
+model.ordinal <- ordinal::clm(quality.o ~ ., 
+                     data = wine2[,-c(12, 13, 14)])
+summary(model.ordinal)
+```
+
+We have a really nice ordinal model here. Similar to the linear regression model, we have all except `citric_acid` turning up significant at 5% level. The two threshold are also statistically significant indicating that our model identified distinct thresholds to isolate 6 from 5 and 7 from 6. Let's study the model performance using a confusion matrix.
+
+```{r}
+confusionMatrix(reference = wine2$quality.o,
+                unlist(predict(model.ordinal, 
+                               newdata = wine2, 
+                               type = "class")))
+```
+
+As it turns out at 58% the model accuracy is reasonable but not that great. Ordinal regression is the most appropriate model in this case, however. This is because `quality` is actually ordinal.
+
+**Exercise**: Estimate wine quality model using SVM and `quality.o`. Check whether it has a better model performance than previous models.
+
+In the analysis that I did separately to run SVM using ordinal quality, I found that the out of sample accuracy for SVM was 70%, which is better than any other model we looked at so far. 
+
+## Summary
+
+The objective of this chapter was to model one variable, wine quality, treating it as continuous, nominal, and ordinal. Depending on the type of the variable, we ended up using linear model, multinomial logistic regression, support vector machines, and ordinal regression. This exercise suggests that wine quality is not determined by the wine's chemical composition alone.^[The original data set stripped out other relevant information such as price and brand of the wine. Perhaps including these variables will lead to a better model performance.]
+
+A common point of failure for MNL, SVM, and ordinal regression was that they incorrectly categorized a lot of quality 7 wines as quality 6 wines. Perhaps this suggests that there is not much difference between these two wines and the models are getting confused. Therefore, model accuracy can be improved if we combine these two groups together.
+
+
