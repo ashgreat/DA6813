@@ -1,0 +1,318 @@
+---
+title: "Twitter Analysis"
+author: "Ashwin Malshe"
+date: "5/7/2019"
+output: html_document
+---
+
+# Twitter Sentiment
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+```
+
+Social media analysis is highly popular. This chapter has two exercises using Twitter data. You can extend it to other social networks too. We will access Twitter using their official application programming interface (API). However, Facebook, Instagram, and LinkedIn don't have easily accessible APIs any more so our choices are limited.
+
+## Tasks to complete
+
+The objectives of this exercise are as follows &mdash;
+
+1. Collect a large number of tweets for a trending hashtag
+
+2. Create a map of the tweets based on their location
+
+3. Do sentiment analysis on the tweets
+
+4. Create a wordcloud
+
+## Twitter API access
+
+In order to get access to Twitter API, you will have to request for a developer account. It's a free account but Twitter controls the approval process and it is not automatic. It can take anywhere from a few minutes to a few days. However, your chances of getting a quick approval are higher if you use your `.edu` email address to create an account. Also note that you will have to provide a valid mobile number. 
+We will use `rtweet` package written by Mike Kearney, who has written a nice vignette for getting Twitter authentication. Please follow all the steps and create an aunthetication token first. The vignette is available here: https://rtweet.info/articles/auth.html
+
+I strongly recommend that you use the second method titled **Access token/secret method** in this vignette. For this exercise, I assume that you have this token generated and stored on your hard drive. When you save it on your hard drive, **please don't use any file extension**.
+
+Note that without the token you will not be able to obtain data from Twitter. However, for the sake of this exercise, I have already downloaded Tiwtter data and made available to you from this link:
+
+
+## Collect tweets
+
+The first order of the business is to collect the tweets. Ideally, you would like to collect the tweets about a topic that is trending on the day you are reading this text. Currently^[May 7, 2019] for me it is "Liverpool" referring to the football (soccer) team in the UK. Liverpool beat Barcelona to qualify for the Champions League final.
+
+
+Load up the necessary libraries
+
+```{r warning=FALSE, message=FALSE, error=FALSE}
+
+library(rtweet)  # Twitter package
+library(dplyr)
+library(ggplot2)
+library(sf)   # For making maps
+library(usmap)
+library(reshape2)
+
+# Packages for text analysis and wordcloud
+library(tm)
+library(syuzhet)
+library(tidytext)
+library(ggwordcloud)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+
+```
+
+
+Next, load your Twitter token into the environment. Note that you are going to read this file from the place you saved your token. I am assuming that your token is saved with "twitter_token" as the name. Again, note that there is no file extension because you saved it without an extension.
+
+```{r eval=FALSE}
+load(here::here("twitter_token"))
+```
+
+After this, you should see your Twitter token in the Global Environment on the top right window in RStudio.
+
+### Get the tweets mentioning "Liverpool"
+
+We will use `search_tweets()` function to search and download tweets. Twitter's rate limit restricts downloding 18,000 tweets every 15 minutes. If you want to download more tweets, you will have to accordingly wait.^[For instance, if you want to download 20,000 tweets, Twitter will first download 18,000 tweets and then rate limit will set in. You will have to wait for about 15 minutes after which the remaining 2,000 tweets will be downloaded.] We will doanload 18,000 tweets from the USA sent out in English. You can easily change these as you want.
+
+```{r eval=FALSE}
+lp <-  search_tweets(q = "Liverpool", 
+                     lang = 'en',
+                     geocode = lookup_coords("usa"),
+                     n = 18000, 
+                     include_rts = FALSE, # exclude retweets
+                     )
+```
+
+
+The search and download usually takes only about a couple of minute or so. Twitter's API returns all the data in `json` format but `rtweet` converts it into a `data.frame`.
+
+
+## Data exploration
+
+Twitter gives out a lot of information but `rtweet` returns only some of it. Yet, `lp` is a large data frame with 17,905 observations and 88 variables. Let's see what variable names we have.
+
+```{r}
+names(lp)
+```
+
+It is not possible to provide description for each of these variables. However, the variables are a mix of user data and tweet data. For instance, `user_id` tells us the unique user id while `status_id` is the unique id given to this tweet. 
+
+
+I would like to show you two interesting variables: `source` and `verified`. The first one contains the information on the device that was used to send out the tweet. The second variable tells us whether the person has a verified Twitter account.
+
+Using `count()` function from `dplyr` we can see which device is the most popular. As we may have the same person tweeting multiple times, we will keep only distinct `user_id`-`source` pairs.
+
+```{r}
+lp %>% 
+  distinct(user_id, source) %>% 
+  count(source, sort = TRUE) %>% 
+  top_n(10)
+```
+
+This particular phenomenon is more prevalent in the US. In the other countries, Twitter for iPhone usually topis the list.
+
+How many verified accounts do we have in our sample?
+
+```{r}
+lp %>% 
+  distinct(user_id, verified) %>% 
+  count(verified, sort = TRUE)
+```
+
+It's impressive that we have 370 verified accounts. Later we will see whether their twitter sentiment is different from non-verified accounts.
+
+## Mapping tweets
+
+As the data obtained is from the US, we should be able to make a map of these tweets very easily. Most people on Twitter do not disclose their location. But as we have a lot of tweets, we will find some of them with their location public. Twitter returned `geo_coords` variable, which has the latitude and longitude. We will use a handy function from `rtweet` to extract those.
+
+```{r}
+lp_geo <- lat_lng(lp)
+```
+
+Now, we have two new variables `lng` and `lat` in the data set.
+
+Next, we create a base map object for 48 states. For this we need to obtain the shape files from the US Census Bureau. Download them from here: https://www.census.gov/geo/maps-data/data/cbf/cbf_state.html
+
+
+```{r}
+
+usa_48 <- sf::st_read( "cb_2017_us_state_20m.shp") %>%
+  filter(!(NAME %in% c("Alaska", 
+                       "District of Columbia", 
+                       "Hawaii", 
+                       "Puerto Rico")))
+
+```
+
+
+
+Plot these using `ggplot`
+
+```{r}
+ggplot(data = usa_48) +
+  geom_sf() +
+  theme_minimal()
+```
+
+Now, we will overlay the Twitter data on top of the US map. For this, we will have to convert it into an `sf` object.
+
+```{r}
+
+lp_geo_sf <- st_as_sf(filter(lp_geo, !is.na(lat)),
+                         coords = c("lng", "lat"))
+st_crs(lp_geo_sf) <- 4326   # set the coordinate reference system
+
+```
+
+Now we are ready to make the plot!
+
+```{r}
+ggplot() + 
+  geom_sf(data = usa_48, fill = "#2b2b2b") +
+  geom_sf(data = lp_geo_sf,
+          shape = 16, 
+          alpha = 0.5,
+          color = "#1da1f2") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid.major = element_blank())
+```
+
+You may try to find some pattern here, but in my experience, Twitter activity is pretty much correlated with the population.
+
+## Sentiment analysis
+
+We will do some basic sentiment analysis. The objective is to find out the general sentiment in our tweets. The variable of interest here is `text`, which has all the tweet text. We will use lexicon-based method to identify the sentiment in each tweet first and then we will aggregate them all. For this, we will use `get_nrc_sentiment()` function from `syuzhet` package. Note that the execution takes some time so please be patient.
+
+```{r eval = FALSE}
+lp_sent <- lp$text %>% 
+    syuzhet::get_nrc_sentiment()
+
+```
+
+
+Take a peek at the data
+
+```{r}
+head(lp_sent) %>% 
+  knitr::kable(caption = "Twitter Sentiment")
+```
+
+
+In the above table, the numbers mean the number of words in each tweet that fall into that specific sentiment category. So the first tweet has 2 words indicating anticipation and fifth tweet has 3 words indicating trust. It's better to aggregate the sentiments and plot them for easy interpretations.
+
+```{r}
+lp_sent %>% 
+  summarize_all(sum, na.rm = TRUE) %>% 
+  select(-negative, -positive) %>% # Dropping these helps in plotting
+  reshape2::melt() %>% 
+  ggplot(aes(reorder(variable, -value), value)) +
+  geom_col() +
+  labs(x = "Sentiment", y = "Frequency of Words") +
+  theme_minimal()
+```
+
+Plot only positive and negative sentiment.
+
+```{r}
+lp_sent %>% 
+  summarize_all(sum, na.rm = TRUE) %>% 
+  select(negative, positive) %>% 
+  reshape2::melt() %>% 
+  ggplot(aes(reorder(variable, -value), value)) +
+  geom_col() +
+  labs(x = "Sentiment", y = "Frequency of Words") +
+  theme_minimal()
+```
+
+Certainly, the tweets have a lot of positive sentiment! But does that matter to make tweets more popular?
+
+### Linear regression
+
+```{r}
+
+cbind(lp, lp_sent) %>% 
+  mutate(favorite_count = favorite_count + 1) %>% 
+  lm(log(favorite_count) ~ anger + anticipation + disgust + fear + joy +
+             sadness + surprise + trust + verified + log(followers_count+1),
+           data = .) %>% 
+  summary()
+```
+
+So, it looks like joyful and trusting tweets are favorited a lot while tweets with surprise are less favorited. Note that I have controlled for the follower count as well as whether the account was verified. Both these variables are highly significant.^[**As an exercise, rerun the above regression using `retweet_count` as the dependent variable.**]
+
+## Create a wordcloud
+
+Wordcloud is a popular visualization tool, yet I am not a big fan of it. However, it seems that managers love a wordcloud because they can get the main message in one quick look. We will create a wordcloud using `eom_text_wordcloud()` function from `ggwordcloud` package.
+
+Before we can make a wordcloud, there is some preprocessing of the text that is necessary. First of all, we need to tokenize the text so that we have all the words separately identified. Next, we get rid of all the "stop words" such as articles (e.g., the, an), pronouns (e.g., he, she, it), etc. We also need to remove other words that we think may contaminate the wordcloud.^[This requires some trial and error.] 
+
+Create a tibble of all the words we want to get rid of. This list needs to be updated depending on what shows up in the wordcloud below.
+
+```{r}
+exclude_words <- tibble(word = c("http", "https", "twitter", "t.co",
+                                 "liverpool", "barcelona", "barca"))
+```
+
+We have to first get the words from all the tweets
+
+```{r}
+word_tokens <- lp_geo %>% 
+  select(status_id, text) %>% 
+  tidytext::unnest_tokens(word, text) %>% 
+  anti_join(stop_words) %>% 
+  anti_join(exclude_words)
+
+head(word_tokens)
+```
+
+The first few words that we see are probably hashtags this user used. We don't need to pay attention to individual words at this point.
+
+Find the frequency of each word and then rank them in descending order
+
+```{r}
+word_tokens_count <- word_tokens %>% 
+  count(word, sort = TRUE)
+
+head(word_tokens_count)
+```
+
+Make the wordcloud
+
+```{r}
+set.seed(2019)
+
+word_tokens_count %>% 
+  top_n(30) %>% 
+  ggplot(aes(label = word, size = n, color = word)) +
+  scale_size_area(max_size = 10) +
+  geom_text_wordcloud() +
+  theme_minimal()
+```
+
+
+Another way you can create wordcloud quickly is using a custom R function available from [STHDA](http://www.sthda.com/english/wiki/word-cloud-generator-in-r-one-killer-function-to-do-everything-you-need)
+
+```{r}
+source('http://www.sthda.com/upload/rquery_wordcloud.r')
+
+```
+
+Full wordcloud. The default is to plot 200 words.
+
+```{r warning=FALSE, message=FALSE, error=FALSE}
+rquery.wordcloud(x = lp$text, type = "text")
+```
+
+Wordcloud without the excluded words:
+
+```{r warning=FALSE, message=FALSE, error=FALSE}
+rquery.wordcloud(x = lp$text, type = "text",
+                 excludeWords = c("http", "https", "twitter", "t.co",
+                                 "liverpool", "barcelona", "barca"),
+                 max.words = 50)
+```
+
