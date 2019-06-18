@@ -1,0 +1,324 @@
+---
+title: "Untitled"
+author: "Ashwin Malshe"
+date: "5/11/2019"
+---
+
+# Airlines Customer Satisfaction
+
+Just over one year ago I wrote a blog post titled "Customer Satisfaction of American Airline Companies" on Wordpress.com.^[https://ashwinmalshe.wordpress.com/2016/04/03/customer-satisfaction-of-american-airline-companies/] In that post I compared Twitter sentiment of a few American airlines to the customer satisfaction scores reported by University of Michigan's [American Customer Satisfaction Survey (ACSI)](https://www.theacsi.org). I found that the correlation bewteen Twitter sentiment and ACSI was 0.77. I did not report rank correlation but I recall that it was about the same or slightly lower. 
+
+In this chapter we will recreate this analysis.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(kableExtra)
+```
+
+
+## American Customer Satisfcation Index
+
+Before we proceed with the analysis, it is important to understand what ACSI is and how it is calculated. I strongly recommend reading this brief description on their [website](https://www.theacsi.org/about-acsi/the-science-of-customer-satisfaction). Marketing academicians, including yours truly^[https://www.ashwinmalshe.com/files/Malshe_Agarwal_2015.pdf], have extensively used ACSI in their research.
+
+Even though it is very popular, ACSI has many drawbacks. One major drawback is that for any given brand it is reported only once a year. However, customer satisfaction changes a lot even from month to month. As Twitter data is easily available, perhaps companies can use it instead of ACSI.
+
+## Tasks to complete
+
+In this exercise we will complete following tasks:
+
+1. Download tweets on 9 American airlines which are covered by ACSI.
+
+2. Perform sentiment analysis on the tweets.
+
+3. Correlate Twitter senitment scores with ACSI and report the results.
+
+
+## Download tweets
+
+Start with loading Twitter credentials in your R session and loading relevant packages as shown below. For instructions on getting a Twitter token, please see Chapter \@ref().
+
+
+```{r warning=FALSE, message=FALSE, error=FALSE}
+library(rtweet)  # Twitter package
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(purrr)
+library(janitor) # Row percentages
+library(Hmisc) # Correlations
+library(ggcorrplot) # Correlations plot
+
+# Packages for text analysis
+library(syuzhet)
+```
+
+
+Load Twitter token
+
+```{r eval=FALSE}
+load(here::here("twitter_token"))
+```
+
+Take a look at the ACSI scores of airlines.^[https://www.theacsi.org/acsi-benchmarks/benchmarks-by-industry]
+
+Table \@ref(tab:air-tab) shows Twitter handles for the airlines. I also copied the 2019 scores and pasted in this table.
+
+```{r air-tab,echo=FALSE}
+
+tibble(
+  Airline = c("Alaska", "Southwest", "JetBlue", "Delta", "American", "Allegiant", "United", "Frontier", "Spirit"),
+  `Twitter Handle` = c("@AlaskaAir", "@SouthwestAir", "@JetBlue", "@Delta", "@AmericanAir", "@Allegiant", "@United", "@FlyFrontier", "@SpiritAirlines"),
+  `ACSI Score` = c(80, 79, 79, 75, 73, 71, 70, 64, 63)
+) %>% 
+  knitr::kable(caption = "Airlines Customer Satisfaction",
+               booktabs = TRUE) %>% 
+  kable_styling()
+
+```
+
+
+From Table \@ref(tab:air-tab), Alaska Airlines has the highest customer satisfaction while Frontier and Spirit have the lowest customer satisfaction. Both these airlines are low cost and people constantly complain about them.^[Check out the reviews of Frontier on [TripAdvisor](https://www.tripadvisor.com/ShowUserReviews-g1-d8729213-r449128063-Frontier_Airlines-World.html).]
+
+
+### Collect tweets
+
+In the following code, we first create a vector `airline_tw` which has Twitter handles for the 9 airlines. Next we set up an empty list `airlines_list` to hold the tweets for each airline. The critical piece of code is the `for` loop. We will download up to 2,000 tweets per airline. You can try to download more if you want. I just wanted to stay within the rate limit and get all the tweets at once.^[Recall that Twitter allows you to download 18,000 tweets every 15 minutes.] We also limit the language of the tweets to English and geography to the US.
+
+The output of the following code will be `airlines_list` with 9 data frames with a maximum of 2,000 rows in any data frame.^[It will take about 5-10 minutes depending on your Internet speed.]
+
+```{r eval=FALSE}
+airline_tw <- c("@AlaskaAir", "@SouthwestAir", "@JetBlue",
+                "@Delta", "@AmericanAir", "@Allegiant", 
+                "@United", "@FlyFrontier", "@SpiritAirlines")
+
+airlines_list <- list()
+
+for (i in 1:9) {
+  print(paste("Getting tweets for", airline_tw[i]))
+  
+  airlines_list[[i]] <- search_tweets(
+    q = airline_tw[i], 
+    lang = 'en',
+    geocode = lookup_coords("usa"),
+    n = 2000, 
+    include_rts = FALSE, # exclude retweets
+    )
+}
+
+```
+
+
+### Adding airline as a column
+
+Ideally we would like to stack 9 data frames on top of each other and then carry out the sentiment analysis. However, none of the data frames has a column that identifies which airline the tweets belong to! I strongly encourage you to take a look at any of the 9 data frames by using `names()` and `head()` functions.
+
+In order to add a column in each data frame while still being a part of the list, we will use `map2_dfr()` function from `purrr` package. This function iterates over two arguments simultaneously and then row binds the resulting data frames. In the code below, it will iterate over the list `airlines_list` while also iterating over the vector `Airline`. Note that `Airline` just holds the names of the 9 airlines. `map2_dfr()` will then add (using `mutate()`) a column called `airline` to each data frame stored in `airlines_list` and assign this column the value stored in the vector `Airline`.^[If you find this confusing, you need to read more on `map()` family of functions from `purrr`.]  Finally, it will row bind these 9 data frames and return a single data frame called `airlines_df`.
+
+```{r}
+
+Airline = c("Alaska", "Southwest", "JetBlue", 
+            "Delta", "American", "Allegiant", 
+            "United", "Frontier", "Spirit")
+
+airlines_df <- map2_dfr(.x = airlines_list,
+                          .y = Airline,
+                          ~ mutate(.x, airline = .y) )
+```
+
+
+## Sentiment analysis
+
+Now that we have assembled the data set with tweets pertaining to the 9 airlines, we are ready to do sentiment analysis. We will use `get_nrc_sentiment()` from `syuzhet` package. The input to this function is a character vector. Therefore, we will siply `pull()` this vector out from `airlines_df`.
+
+**Depending on the number of tweets this code will take a few minutes to execute so please be patient.**
+
+```{r eval=FALSE}
+airlines_sent <- airlines_df %>% 
+  pull(text) %>%  # This returns a character vector 
+  get_nrc_sentiment()
+```
+
+
+Take a look at the sentiment data using `head()`. For my sample, the results are shown in Table \@ref(tab:tab-senti),
+
+```{r tab-senti ,echo=FALSE}
+head(airlines_sent, 8) %>% 
+  kable(caption = "Airlines Sentiment",
+        booktabs = TRUE) %>% 
+  kable_styling()
+```
+
+
+## Net Sentiment Score (NSS)
+
+In this step, we will aggregate the sentiment at airline level so that we will have just 1 observation for every airline. However, note that `airlines_sent` does not have any column identifying the airline. This is because we used only the `text` column from that data set. In the code below, we will first add back some of the relvant variables using `cbind()`. The variables of interest are `airline`, `favorite_count`, and `retweet_count`. We will retain `favorite_count`, and `retweet_count` because they can be used as weights. 
+
+
+In the code below, I have commented the blocks. They are self explanatory. The last block where we calculate the net sentiment scores (NSS) needs some explanation. NSS are similar to the (in)famous Net Promoter Score (NPS).^[Read more [here](https://www.netpromoter.com/know/)] The idea is that we take the difference between the positive sentiment and negative sentiment scores and divide this difference by the total tweets (or sum of weights for weigted metric). The NSS formula in general for our case is as follows:
+
+$$ NSS = \frac{\sum{w_i.PS_i} - \sum{w_i.NS_i}}{\sum{w_i}} $$
+
+where, $w_i$ is the weight assigned to the tweet (i.e., number of favorites or retweets), $PS_i$ is the positive sentiment score of a given tweet, and $NS_i$ is the negative sentiment score of a given tweet. For raw NSS, where we do not weight by number of favorites or retweets, $w_i = 1 \quad \forall i$ 
+
+```{figuremargin}
+There is no reason to believe that NSS will correlated strongly with ACSI. However, in my blog post it did and here we are assessing whether that relationship still holds.
+
+```
+
+
+
+```{r}
+airlines_final <- cbind(
+  airlines_df %>% select(airline, favorite_count, retweet_count), 
+  airlines_sent %>% select(negative, positive)
+  ) %>% 
+  # Create new "weighted" variables
+  mutate(negative_fav = negative * favorite_count,
+         positive_fav = positive * favorite_count,
+         negative_rt  = negative * retweet_count,
+         positive_rt  = positive * retweet_count) %>% 
+  # Get the sum of these variables for each airline
+  group_by(airline) %>% 
+  dplyr::summarize(neg_sum     = sum(negative),
+              neg_fav_sum = sum(negative_fav),
+              neg_rt_sum  = sum(negative_rt),
+              pos_sum     = sum(positive),
+              pos_fav_sum = sum(positive_fav),
+              pos_rt_sum  = sum(positive_rt),
+              fav_sum     = sum(favorite_count),
+              rt_sum      = sum(retweet_count),
+              tot_obs     = n()) %>% 
+  ungroup() %>% 
+  # Calculate sentiment metrics
+  mutate(nss     = (pos_sum - neg_sum) / tot_obs,
+         nss_fav = (pos_fav_sum - neg_fav_sum) / fav_sum,
+         nss_rt  = (pos_rt_sum - neg_rt_sum) / rt_sum) %>% 
+  # Add the column of customer satisfaction
+  mutate(acsi = c(80, 71, 73, 75, 64, 79, 79, 63, 70))
+
+```
+
+
+
+## Moment of truth
+
+Now comes the final stage where we check the correlations between various NSS measures and ACSI. For this I use `ggcorplot()` function from `ggcorplot` package. As this is not a major topic for this exercise, I leave the explanation of the code to you as an exercise.  
+
+
+```{r fig-cor}
+ggcorrplot::ggcorrplot(
+  airlines_final %>% 
+    select(starts_with("nss"), acsi) %>% 
+    cor() %>% 
+    round(2), 
+  p.mat = ggcorrplot::cor_pmat(
+    airlines_final %>% 
+      select(starts_with("nss"), acsi)
+    ),
+  hc.order = TRUE, 
+  type = "lower",
+  outline.color = "white",
+  ggtheme = ggplot2::theme_minimal,
+  colors = c("#cf222c", "white", "#3a2d7f")
+  )
+```
+
+
+Looks like ACSI has somewhat negative correlations with each of the NSS metric! This is not good news...for ACSI! :)Furthermore, the crosses on the squares indicate statistical non-significance. However, as I explain below, we will do a better comparison with more direct sentiment metrics.
+
+Table \@ref(tab:tab-cor) shows the correlations in numbers. Indeed, ACSI is marginally negatively correlated with NSS metrics.
+
+
+```{r tab-cor, echo=FALSE}
+  airlines_final %>% 
+    select(starts_with("nss"), acsi) %>% 
+    cor() %>% 
+    round(3) %>% 
+  kable(caption = "Sentiment and ACSI Correlations") %>% 
+  kable_styling()
+```
+
+## Correlating with granual sentiments
+
+Thus far we used only positive and negative sentiments. However, we actually have much granual sentiment scores in the data. Let's check whether these scores do a better job of explanaing the pattern in the data.
+
+For this, we will simply use the percentage of words with a specific sentiment in a tweet. For instance, if there were 2 words that were labeled as "joy" by `syuzhet` out of the 5 words it labaled overall from a tweet, we consider it is 40% (2/5) joy. It's not the cleanest metrics but it will work.
+
+To calculate row percentages, we will use `adorn_percentages()` function from `janitor` package. This function has two drawbacks. First, it assumes that the first column is "id" column and it doesn't take it into account for row calculations. We overcome this problem by adding a column of airlines and then making it the first column using `select()` function from `dplyr`. Second, the package returns `NaN` when the row sums are 0. This is not a drawback in general but our application needs a 0 in place of `NaN`. We will fix this using `is.na()` function from base R. 
+
+```{r}
+
+sent_cor <- airlines_sent %>%
+    # Add airline names
+  mutate(airline = airlines_df$airline) %>% 
+  select(airline, everything(), -c(positive, negative)) %>% 
+  janitor::adorn_percentages() %>% 
+  as.data.frame()
+
+# Replace NaN with 0
+
+sent_cor[is.na(sent_cor)] <- 0
+
+# Finally summarize and add ACSI
+
+sent_cor <- sent_cor %>% 
+  group_by(airline) %>% 
+  summarize_if(is.numeric, mean) %>% 
+  # Add ACSI scores
+  mutate(acsi = c(80, 71, 73, 75, 64, 79, 79, 63, 70)) %>% 
+  select(-airline)
+```
+
+### Correlation plot
+
+Figure \@ref(fig:fig-cor2) shows the correlation plot.
+
+```{r fig-cor2}
+ggcorrplot::ggcorrplot(
+  sent_cor %>% 
+  cor(method = "pearson") %>% 
+  round(3), 
+  p.mat = ggcorrplot::cor_pmat(sent_cor, method = "pearson"),
+  hc.order = TRUE, 
+  type = "lower",
+  outline.color = "white",
+  ggtheme = ggplot2::theme_minimal,
+  colors = c("#cf222c", "white", "#3a2d7f")
+  )
+```
+
+ACSI has positive correlations with joy, surprise, and anticipation. It has negative correlations with the rest. Surprisingly, it has a negative correlation with trust.^[Any speculations for this result?] Unfortunately, none of these correlations is statistically significant at 5% level of significance! This is somewhat expected because we have only 9 airlines.
+
+### Correlation matrix
+
+Let's take a look at the correlations as shown in Table \@ref(tab:tab-cor2). We will also output the p values this time. For this, we will use `rcorr()` function from `Hmisc` package. `rcorr()` outputs a list with correlations and their p values in separate matrices. 
+
+
+
+```{r}
+
+sent_cor %>% 
+  as.matrix() %>% 
+  Hmisc::rcorr() %>% 
+  .$r %>%
+  round(3)
+```
+
+
+
+Table \@ref(tab:tab-cor2p) shows the p values corresponding to the correlation coefficients. The p value for the correlation coefficient between ACSI and joy is significant at 10% level. 
+
+```{r}
+
+sent_cor %>% 
+  as.matrix() %>% 
+  Hmisc::rcorr(type = "pearson") %>% 
+  .$P %>%
+  round(3)
+```
+
+
+## Summary
+
+In this chapter, we analyzed the correlations between Twitter sentiment and customer satisfaction of 9 American arilines. We used American Customer Satisfaction Index (ACSI) as the measure of customer satisfaction. We find that there is little correlation between the two metrics. However, ACSI is measured only once annually while Twitter sentiment can be obtained every single day. Furthermore, ACSI is a measure of customer satisfaction. Twitter sentiments that we used do not necessarily say anything about satisfied customers. It could be a good metric for brand attitude instead.
