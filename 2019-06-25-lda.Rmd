@@ -1,0 +1,344 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(knitr)
+```
+
+# Topic Modeling
+
+Topic modeling allows us to identify topics embedded in the textual data. The assumption is that each text document is composed of one or more topics, which are latent. The job of a topic model then is to extract the topics from text. In this chapter we will use a popular probabilistic model called Latent Dirichlet Allocation (LDA) first introduced by Blei, Ng, and Jordan (2003).^[Blei, David M (2003), "Latent Dirichlet Allocation," Journal of Machine Learning Research, 3, 993–1022.] LDA is a unsupervised machine learning method as we don't know the target variable (i.e., the latent topic) ex ante. 
+
+## Latent Dirichlet Allocation
+
+Imagine that you are in your dentist's waiting room. You pick up a magazine and casually start browsing it. While eyeballing text on random pages, you came across the following text:
+
+_Williamson and Taylor then began to reap the rewards of their patience and accelerated their way to an immensely productive partnership of 160 from 28.5 overs before Taylor chipped to Jason Holder at mid-on off the bowling of Chris Gayle to depart for 69. Williamson remained steady as ever and went on to record his second consecutive hundred, following on from his knock against South Africa on Wednesday. The Kiwi skipper eventually fell for 148, amassing over half of his side’s final total of 291. Cottrell was West Indies’ leading man, finishing with figures of 4/56._
+
+_With Evin Lewis suffering an injury to his hamstring, Shai Hope joined Chris Gayle at the crease to begin the chase, but the right-hander perished early to Trent Boult, and Nicholas Pooran followed him back to the sheds not long after. Gayle took a liking to Matt Henry’s bowling and his partnership with Shimron Hetmyer – featuring some monstrous sixes – saw West Indies take control of the match. The game then swung back in the Black Caps’ favour as Lockie Ferguson interrupted with the removal of Hetmyer with an incredible slower ball that initiated a collapse of five wickets for 22 runs._^[Source: https://www.cricketworldcup.com/news/en/1253879]
+
+Unless you are from the UK, Indian Subcontinent, Australia, New Zealand, South Africa, or the Caribbean, there is little chance you understood anything meaningful in this text! However, some of these words look familiar to you: **ball**, **total**, **match**, **game**, and **runs**. These words give you a hint about the topic underlying this text. This looks like a sports article discussing a game between South Africa and West Indies. Indeed, after some Google search, you find out that this is game of Cricket.
+
+Note that in order to determine the topic underlying the text, you used some of the words in the text. In an article that describes a game of Cricket, it is likely that the article will use words associated with Cricket. However, some of these words also may appear in an article about Baseball. So there is some uncertainty in your mind about the topic of the text. You decide to assign 60-40 probabilities to Cricket and Baseball.
+
+LDA works on a similar principle. It assumes a data generating process under which a document is generated based on a mix of latent topics and the words that pertain to those topics. As such LDA treats an article as a "bag of words". LDA ignores the ordering of those words. Thus, for LDA both these sentences are the same:
+
+*Williamson remained steady as ever and went on to record his second consecutive hundred, following on from his knock against South Africa on Wednesday.*
+
+and
+
+*steady remained Williamson as ever and record on to went his hundred second consecutive Wednesday against Africa South on, knock following on from his. *
+
+LDA assumes that each document has a set of topics, which follow multinomial logistic distribution. However, the probabilities of the multinomial model are not fixed for all the documents. LDA assumes that the distribution of probabilities follow Dirichlet distribution. Thus, for each document, the topics are random draws from a multinomial distribution. The probabilities of the multinomial distribution are in turn are random draws from Dirichlet distribution. The choice of this distribution is due to mathematical convenience as Dirichlet distribution is a conjugate prior to multinomial logistic distribution. As a result, the ***posterior*** distribution of the probability distribution is Dirichlet too. This significantly simplifies the inference problem.^[For a partial mathematical treatment please refer to the original paper cited above.]
+
+Our task in topic modeling using LDA can be broken down in the following steps:
+
+1. Create a corpus of multiple text documents.
+
+2. Preprocess the text to remove numbers, stop words, punctuation, etc. Additionally, use stemming.
+
+3. Decide the number of topics and fit LDA on the corpus. The number of topics is a hyperparameter to tune.
+
+4. Get the most common words defining each topic. Give them meaningful labels.
+
+
+## Data
+
+Load/install the packages as follows.
+
+**In the classroom if `qdap` fails to install, ignore it for the time being.**
+
+```{r}
+pacman::p_load(dplyr, 
+               ggplot2, 
+               tm, # For textmining 
+               topicmodels, # For LDA
+               #qdap, # For some text cleaning
+               caret # For random forest
+               )
+```
+
+We will use a Kaggle dataset consisting of 34,000 Amazon product reviews such as Kindle, Fire TV Stick, etc., provided by Datafiniti:
+
+https://www.kaggle.com/datafiniti/consumer-reviews-of-amazon-products
+
+Download `1429_1.csv` file from Kaggle. You can also download this file from my Github repository: https://github.com/ashgreat/datasets/blob/master/1429_1.csv.zip. As the file size is 49 MB, I recommend downloading the zip file first to your computer and then reading it. 
+
+```{r eval=FALSE}
+reviews <- readr::read_csv("1429_1.csv.zip")
+```
+
+Take a look at the column names
+
+```{r}
+names(reviews)
+```
+
+
+
+## Pre-processing
+
+We will extract only the review text.
+
+```{r}
+review_text <- reviews %>% pull(reviews.text)
+```
+
+### Get stop words
+
+I have compiled a large list of stop words from various sources. The list consists of 1,182 stop words. You can download them from my Github repository: https://github.com/ashgreat/datasets/blob/master/my-stopwords.rds?raw=true
+
+```{r eval=FALSE}
+my_stopwords <- readRDS(gzcon(url("http://bit.ly/2X1Wv2x")))
+```
+
+Take a look at some of the stop words
+
+```{r}
+head(my_stopwords, 10)
+```
+
+### `tm` package
+
+`tm` is a powerful package for text processing. For it to operate, we will first create a corpus of all the documents. Next, we will use `tm_map` function to remove stop words, numbers, punctuation, white space. Finally we will also stem the words. 
+
+```{r eval=FALSE}
+rev_corpus <- tm::Corpus(VectorSource(review_text)) %>% 
+  tm_map(content_transformer(tolower)) %>% 
+  tm_map(removeWords, c(my_stopwords, "amazon")) %>% 
+  tm_map(removeNumbers) %>% 
+  tm_map(stripWhitespace) %>% 
+  tm_map(removePunctuation, preserve_intra_word_dashes = TRUE)%>% 
+  tm_map(stemDocument)
+
+```
+
+
+## Document term matrix
+
+Create a document term matrix (DTM) such that it shows the frequency of each word for each document. The DTM rows will have 18,123 documents and the columns will have the unique words. The argument `bounds` in the code below specifies dropping the terms that appear in documents fewer than the lower bound and more than the upper bound. This is instead of using TF-IDF, which is an alternative.
+
+Thus, if a word appears in less than 100 documents or more than 1000 documents, we will drop it.
+
+```{r eval=FALSE}
+dtm <- rev_corpus %>% 
+  DocumentTermMatrix(control = list(bounds = list(global = c(100, 1000)))) 
+```
+
+
+
+With this, we have just 432 words left in the DTM. Perhaps this is too small for the analysis. If you feel so, you could change the bounds.
+
+```{r}
+dim(dtm)
+```
+
+### Remove empty documents
+
+For a few documents, all the frequencies in the corresponding rows are 0. We will get rid of these documents. First, we create an index which will hold the information on the rows to keep. This will be a logical vector.
+
+```{r eval=FALSE}
+index_kp <- rowSums(as.matrix(dtm)) > 0
+```
+
+
+Check how many rows we will keep.
+
+```{r}
+sum(index_kp)
+```
+
+So, we are dropping 18,123 - 17,992 = 131 documents. Next, we will adjust `dtm` and `review_text` so that they each have 17,992 rows/elements.
+
+```{r}
+dtm <- dtm[index_kp, ]
+review_text <- review_text[index_kp]
+```
+
+
+## Fitting the LDA
+
+Now we are ready to fit LDA on our text. For this we will use `dtm`. We have to decide on the number of topics. As this is a hyperparameter we have to tune, we can use a grid search. The optimum value of number of topics will give us the maximum likelihood. I don't go into the details of this, but if you are interested, I recommend checking out Martin Ponweiser's thesis where he provides the method and the R code to do this [PDF]: http://epub.wu.ac.at/3558/1/main.pdf.
+
+`LDA()` gives us the method choice between Variational Expectation-Maximization (VEM) algorithm and Gibb's sampler. We will use the latter. We select `alpha` equal to 0.2. Lower values of `alpha` lead to selecting only a few topics per document. Higher values of `alpha` give us diffused distribution. This is also a hyperparameter you might want to tune using grid search. We select 2,000 iterations out of which the first 1,000 are not used (that's why "burn-in").
+
+The following code took about 30 seconds on my computer.
+
+
+```{r eval=FALSE}
+
+lda_model <- LDA(x = dtm,
+                 k = 20,
+                 method = "Gibbs",
+                 control = list(seed = 5648,
+                                alpha = 0.2,
+                                iter = 2000,
+                                burnin = 1000)
+                 )
+```
+
+
+
+## LDA output {#lda-out}
+
+Now we are ready see the words associated with each of the 20 topics. Recall that we used stemming, which means some of the words will be difficult to read. We print first 10 words for each topic using `terms()` function. 
+
+```{r}
+terms(lda_model, 10)
+```
+
+LDA did a fairly good job of picking topics. For instance, Topic 1 is all about celebrations and festivities. Topic 2 seems to be about Google App Store, Android, and download speeds of the apps. Topic 3 is about speaker quality, Topic 4 is about Internet, Topic 5 is about memory and storage, and so on. 
+
+Topic 20 looks to be about iPad and how it is worth the money. We can expect that whenever this topic showed up, the reviewer probably rated the corresponding Amazon product lower. We will perform this analysis next.
+
+## Topic distribution
+
+We can get some idea about the incidence of each topic in the corpus by looking at the average posterior distribution of the topics. This is arguably a crude way. We can also plot the probability distributions. 
+
+For this, we first need to get the posterior distributions of $\theta$. The function `posterior()` returns posteriors of both $\theta$ and $\beta$. Whereas $\theta$ is the posterior distribution of the topics, $\beta$ is the posterior distributions of the words or terms.
+
+```{r}
+lda_post <- posterior(lda_model)
+theta <- lda_post$topics
+beta <- lda_post$terms
+```
+
+Let's take a look at the average probability of each topic across all the documents.
+
+```{r}
+colMeans(theta)
+```
+
+We see that the average topic incidence probability is pretty much uniform across the documents. Of course, this hides all the variation. Perhaps it is easier to look at the plots of probabilities. Figure \@ref(fig:fig-dist) shows the facet plot.
+
+```{r fig-dist, fig.caption = "Prabability Distribution" ,error=FALSE, warning=FALSE, message=FALSE}
+theta %>% 
+  as.data.frame() %>% 
+  rename_all(~ paste0("topic", 1:20)) %>%
+  reshape2::melt() %>% 
+  ggplot(aes(value)) +
+  geom_histogram() +
+  scale_x_continuous(limits = c(0, 0.8)) +
+  scale_y_continuous(limits = c(0, 13000)) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = "Topic Probability", y = "Frequency") +
+  theme_minimal()
+```
+
+We don't see a lot of variation in the probability distributions. However, this plot doesn't tell us which topics belong to which documents. If some topics tend to relate closely to certain types of reviews, perhaps we can get an idea about how these topics relate to the reviewer rating. We turn to that next.
+
+## Topic importance
+
+LDA doesn't tell us the importance of each topic because it doesn't know how to determine the importance. However, if some topics relate to glowing reviews while some others are related to bad reviews, perhaps we can determine the topic importance by predicting review rating using the topic probabilities.
+
+I will show you how to do it using Random Forest. There is a strong chance that fitting Random Forest model will take a long time so we will skip doing that in the classroom.
+
+
+Before we proceed, we need to create a new data set with the review ratings and topic probabilities. Note that some of the `rating` are missing. Furthermore, I convert `rating` into an ordered factor. This is because there are only 5 distinct values of ratings and they are not uniformly distributed. It's easier to treat it as a classification problem.
+
+```{r}
+theta_rating <- as.data.frame(theta) %>% 
+  rename_all(~ paste0("topic", 1:20)) %>% 
+  mutate(rating = factor(reviews$reviews.rating[index_kp],
+                         ordered = TRUE)) %>% 
+  filter(!is.na(rating))
+```
+
+```{r}
+class(theta_rating$rating)
+```
+
+
+## Random Forest
+
+In order to fit Random Forest, we first specify the control parameters for training. We will use 10-fold cross-validation with 80-20 train and test split. Furthermore, we perform grid search on 18 values of `mtry`.^[I estimated several RFs on various LDAs for this example and I ended up with `mtry = 1` as the best hyperparameter in all the cases.]
+
+```{r}
+trControl <- trainControl(method = "cv",
+                          number = 10,
+                          p = 0.8)
+
+tuneGrid <- expand.grid(mtry = 1:18)
+```
+
+Train the model. **It will take several hours so I suggest you use `tuneGrid = expand.grid(mtry = 1)` in the following code.**
+
+```{r eval=FALSE}
+
+set.seed(9403)
+model_rf <- train(rating ~ . ,
+                  data = theta_rating,
+                  method = "rf",
+                  ntree = 1000,
+                  trControl = trControl,
+                  tuneGrid = tuneGrid # Use expand.grid(mtry = 1) in the class
+                  )
+```
+
+
+
+Figure \@ref(fig:fig-rf) shows the model accuracy as a function of `mtry`. The highest accuracy is obtained when `mtry = 1`.
+
+```{r fig-rf, fig.cap="Random Forest Tuning", fig.margin = TRUE}
+model_rf$results %>% 
+  ggplot(aes(mtry, Accuracy)) +
+  geom_line() +
+  theme_minimal()
+```
+
+
+```{r}
+model_rf$bestTune
+```
+
+
+### Model performance
+
+Note that we did not split the data into train and test set. As such we will assess model performance on the entire training set. We first get the predicted values of `rating` based on our model.
+
+```{r eval=FALSE}
+rf_predict <- predict(model_rf, theta_rating)
+```
+
+Next, we create a confusion matrix using predicted and observed ratings.
+
+```{r}
+confusionMatrix(rf_predict,
+                reference = theta_rating$rating)
+```
+
+The classification accuracy of Random Forest model is 75%, which is only marginally better than the no information rate of 66%. The no information rate is the relative frequency of "5" rating. In other words, if we predicted that every review has a 5 rating, we will be correct 66% of times.
+
+### Variable importance
+
+Finally, it is time to find out the most important topics. The topics that make the most impact on ratings will be considered important. Table \@ref(tab:tab-rf) shows the variable importance. Topics 2, 8, and 10 are the top 3 important topics.
+
+```{r eval=FALSE}
+varImp(model_rf, scale = TRUE)
+```
+
+
+```{r tab-rf, echo=FALSE}
+varImp(model_rf, scale = TRUE)$importance %>% 
+  tibble::rownames_to_column(var = "Topics") %>% 
+  arrange(-Overall) %>% 
+  slice(1:10) %>% 
+  kable(caption = "Random Forest Variable Importance",
+        booktabs = TRUE)
+```
+
+In section \@ref(lda-out) we printed the top 10 words associated with each topic. Let's print them only for Topics 2, 8, and 10 to get a sense of what these topics are.
+
+```{r}
+terms(lda_model, 10)[, c(2, 8, 10)]
+```
+
+It looks like these 3 topics are about complaints pertaining to the Amazon electronics. Topic 2 is about comparison with Google App Store installations, download etc. Topic 8 seems less about the product and more about the review system. Finally, Topic 10 is about WiFi connectivity and charger issues.
+
+Given the distribution of ratings in the data, where 66% of the reviews have 5 rating, it seems logical that the topics related to complaints are helping the model differentiate between the good and bad ratings. This is because reviews with 5 ratings have various topics but none of them with complaints.
+
+## Summary
+
+In this chapter we learned how to fit Latent Dirichlet Allocation model on textual data. We used Amazon product reviews data from Kaggle and identified 20 topics from the review text. Next we determined the importance of topics by classifying product ratings using the posterior probabilities of the topics. For this we used Random Forest. A linear model is difficult to use for this application because the probabilities of each row add up to 1. 
+
+In this example, we used a fixed number of topics. Ideally, we would like to tune this hyperparameters. The chapter references the method to find the optimum number of topics.
